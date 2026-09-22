@@ -57,6 +57,13 @@ type Recognizer interface {
 // range. The operation fails closed so no partially masked text is produced.
 var ErrProtection = errors.New("invalid fragment range")
 
+// Priority returns the conflict-resolution priority of a type. Higher values
+// win when two fragments partially overlap. It is exported so evaluation and
+// other consumers can reproduce the resolution semantics.
+func Priority(t Type) int {
+	return typePriority[t]
+}
+
 // typePriority orders types for deterministic conflict resolution. When two
 // fragments partially overlap, the higher-priority type wins; the overlap is
 // never resolved by extending a range to cover the whole string.
