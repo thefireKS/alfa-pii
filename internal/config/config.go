@@ -48,6 +48,14 @@ type Config struct {
 
 	// MarkerPrefix is the prefix used for generated replacement markers.
 	MarkerPrefix string
+
+	// ConsumersFile is the path to the JSON file defining consumer systems and
+	// regexp rules. Empty means no managed consumers are configured.
+	ConsumersFile string
+	// Consumers are the validated managed consumer policies.
+	Consumers []Consumer
+	// RegexpRules are the validated config-driven recognition rules.
+	RegexpRules []RegexpRule
 }
 
 // Default returns a Config populated with documented default values.
@@ -165,6 +173,18 @@ func Load() (Config, error) {
 	}
 	if v := os.Getenv("PII_MARKER_PREFIX"); v != "" {
 		cfg.MarkerPrefix = v
+	}
+	if v := os.Getenv("PII_CONSUMERS_FILE"); v != "" {
+		cfg.ConsumersFile = v
+	}
+
+	if cfg.ConsumersFile != "" {
+		consumers, rules, err := LoadConsumers(cfg.ConsumersFile)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Consumers = consumers
+		cfg.RegexpRules = rules
 	}
 
 	if err := cfg.Validate(); err != nil {

@@ -87,12 +87,20 @@ var typePriority = map[Type]int{
 	CVV:               30,
 }
 
-// Resolve validates all fragments and resolves overlaps deterministically.
-// Identical and nested ranges collapse to a single range so no byte is
-// replaced twice. A partial overlap keeps the higher-priority type instead of
-// extending to the whole string. An invalid range (out of bounds, inverted,
-// or not on a rune boundary) returns ErrProtection.
+// Resolve validates all fragments and resolves overlaps deterministically
+// using the built-in type priorities.
 func Resolve(text string, frags []Fragment) ([]Fragment, error) {
+	return ResolveWithPriority(text, frags, Priority)
+}
+
+// ResolveWithPriority validates all fragments and resolves overlaps
+// deterministically. Identical and nested ranges collapse to a single range so
+// no byte is replaced twice. A partial overlap keeps the higher-priority type
+// instead of extending to the whole string. An invalid range (out of bounds,
+// inverted, or not on a rune boundary) returns ErrProtection. The priority
+// function orders types for conflict resolution; it is provided so
+// config-driven types can participate with their configured priority.
+func ResolveWithPriority(text string, frags []Fragment, priority func(Type) int) ([]Fragment, error) {
 	n := len(text)
 	rs := make([]Fragment, 0, len(frags))
 	for _, f := range frags {
@@ -111,8 +119,8 @@ func Resolve(text string, frags []Fragment) ([]Fragment, error) {
 		if rs[i].End != rs[j].End {
 			return rs[i].End > rs[j].End
 		}
-		if typePriority[rs[i].Type] != typePriority[rs[j].Type] {
-			return typePriority[rs[i].Type] > typePriority[rs[j].Type]
+		if priority(rs[i].Type) != priority(rs[j].Type) {
+			return priority(rs[i].Type) > priority(rs[j].Type)
 		}
 		return rs[i].Type < rs[j].Type
 	})
@@ -141,7 +149,7 @@ func Resolve(text string, frags []Fragment) ([]Fragment, error) {
 		// the two ranges, keeping the higher-priority type. This never extends
 		// to the whole string, only to the union of the overlapping fragments,
 		// so no sensitive byte of the lower-priority fragment is left open.
-		if typePriority[f.Type] > typePriority[last.Type] {
+		if priority(f.Type) > priority(last.Type) {
 			last.Type = f.Type
 		}
 		last.End = f.End

@@ -27,26 +27,58 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Wire dependencies explicitly at the entry point.
-	recs := []app.Recognizer{
-		recognizer.EmailRecognizer{},
-		recognizer.PhoneRecognizer{},
-		recognizer.INNRecognizer{},
-		recognizer.CardRecognizer{},
-		recognizer.PassportRecognizer{},
-		recognizer.DepartmentCodeRecognizer{},
-		recognizer.DriverLicenseRecognizer{},
-		recognizer.PINRecognizer{},
-		recognizer.CVVRecognizer{},
-		recognizer.FullNameRecognizer{},
-		recognizer.BirthDateRecognizer{},
-		recognizer.BirthPlaceRecognizer{},
-		recognizer.CitizenshipRecognizer{},
-		recognizer.PassportAuthorityRecognizer{},
-		recognizer.PassportIssueDateRecognizer{},
-		recognizer.AddressRecognizer{},
-		recognizer.CardHolderNameRecognizer{},
+	// Build the recognizer registry and register config-driven regexp rules.
+	// The whole configuration is validated before use: an invalid rule or an
+	// unknown type rejects startup with no partial activation.
+	reg := recognizer.NewRegistry()
+	for _, rule := range cfg.RegexpRules {
+		if err := reg.AddRegexpRule(rule.Type, rule.Priority, rule.Pattern, rule.MaxMatches); err != nil {
+			logger.Error("invalid regexp rule", "error", err.Error())
+			os.Exit(1)
+		}
 	}
+
+	// The fixed /process scope protects every built-in type.
+	processTypes := []recognizer.Type{
+		recognizer.Email,
+		recognizer.Phone,
+		recognizer.INN,
+		recognizer.Card,
+		recognizer.Passport,
+		recognizer.DepartmentCode,
+		recognizer.DriverLicense,
+		recognizer.PIN,
+		recognizer.CVV,
+		recognizer.FullName,
+		recognizer.BirthDate,
+		recognizer.BirthPlace,
+		recognizer.Citizenship,
+		recognizer.PassportAuthority,
+		recognizer.PassportIssueDate,
+		recognizer.Address,
+		recognizer.CardHolderName,
+	}
+
+	consumers := make([]app.Consumer, 0, len(cfg.Consumers))
+	secrets := make(map[string]string, len(cfg.Consumers))
+	for _, c := range cfg.Consumers {
+		// Validate that every configured type is known before the service
+		// starts, so an unknown type never activates partially.
+		if _, _, err := reg.Recognizers(c.Types); err != nil {
+			logger.Error("invalid consumer types", "consumer", c.Name, "error", err.Error())
+			os.Exit(1)
+		}
+		consumers = append(consumers, app.Consumer{
+			Name:           c.Name,
+			Enabled:        c.Enabled,
+			Types:          c.Types,
+			MaskingEnabled: c.MaskingEnabled,
+			CanRestore:     c.CanRestore,
+			MaskFormat:     c.MaskFormat,
+		})
+		secrets[c.Secret] = c.Name
+	}
+
 	m := masker.New(cfg.MarkerPrefix)
 	st := store.NewMemory(store.Limits{
 		MaxEntries:      cfg.StoreMaxEntries,
@@ -58,10 +90,15 @@ func main() {
 	})
 	st.StartCleanup()
 	defer st.Stop()
-	svc := app.New(recs, st, m)
+	svc, err := app.NewManaged(reg, processTypes, consumers, st, m)
+	if err != nil {
+		logger.Error("build service", "error", err.Error())
+		os.Exit(1)
+	}
 
 	ready := func() bool { return true }
-	h := httpapi.NewHandler(svc, ready, cfg.MaxActiveRequests, cfg.MaxBodyBytes)
+	auth := httpapi.NewAuthenticator(secrets)
+	h := httpapi.NewHandler(svc, auth, ready, cfg.MaxActiveRequests, cfg.MaxBodyBytes)
 
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,

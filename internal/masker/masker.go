@@ -54,6 +54,32 @@ func (m *Masker) Mask(text string, ranges []Range) (string, []Replacement) {
 	return b.String(), table
 }
 
+// Stars replaces the given ranges in text with a fixed run of asterisks and
+// returns the masked text together with a table mapping each star run to its
+// original. Star runs are ambiguous: two fragments produce identical runs, so
+// substitution-based restoration is not meaningful. Callers must restrict this
+// format to exact restoration of the returned mask.
+func Stars(text string, ranges []Range) (string, []Replacement) {
+	if len(ranges) == 0 {
+		return text, nil
+	}
+	merged := mergeRanges(ranges)
+	table := make([]Replacement, 0, len(merged))
+	var b strings.Builder
+	last := 0
+	for _, r := range merged {
+		b.WriteString(text[last:r.Start])
+		b.WriteString(starRun)
+		table = append(table, Replacement{Marker: starRun, Original: text[r.Start:r.End]})
+		last = r.End
+	}
+	b.WriteString(text[last:])
+	return b.String(), table
+}
+
+// starRun is the fixed replacement used by the stars format.
+const starRun = "****"
+
 // Restore replaces every marker in masked with its original value from the
 // table. Markers not present in the table are left untouched.
 func Restore(masked string, table []Replacement) string {

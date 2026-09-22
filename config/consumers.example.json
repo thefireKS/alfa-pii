@@ -1,0 +1,30 @@
+{
+  "consumers": [
+    {
+      "name": "alpha",
+      "enabled": true,
+      "types": ["email", "phone", "full_name"],
+      "masking_enabled": true,
+      "can_restore": true,
+      "mask_format": "marker",
+      "secret_env": "PII_CONSUMER_ALPHA_SECRET"
+    },
+    {
+      "name": "beta",
+      "enabled": true,
+      "types": ["card", "cvv"],
+      "masking_enabled": true,
+      "can_restore": false,
+      "mask_format": "stars",
+      "secret_env": "PII_CONSUMER_BETA_SECRET"
+    }
+  ],
+  "regexp_rules": [
+    {
+      "type": "contract_number",
+      "priority": 65,
+      "pattern": "договор №[0-9]{6}",
+      "max_matches": 100
+    }
+  ]
+}

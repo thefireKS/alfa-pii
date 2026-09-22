@@ -28,6 +28,9 @@ type Record struct {
 	Masked string
 	// Table maps markers to original values for restoration.
 	Table []Replacement
+	// Format is the mask format used to produce Masked. It is bound to the
+	// record so restoration uses the same format that created the mask.
+	Format string
 	// CreatedAt is the wall-clock time the record was created.
 	CreatedAt time.Time
 }
