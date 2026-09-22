@@ -9,3 +9,5 @@ dist
 coverage
 coverage.out
 *.test
+.agents/
+skills-lock.json
