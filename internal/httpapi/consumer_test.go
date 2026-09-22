@@ -22,7 +22,7 @@ func newConsumerHandler(consumers []app.Consumer, secrets map[string]string) (*H
 	if err != nil {
 		return nil, err
 	}
-	return NewHandler(svc, NewAuthenticator(secrets), func() bool { return true }, 10, 1<<20), nil
+	return NewHandler(svc, NewAuthenticator(secrets), func() bool { return true }, 10, 1<<20, nil, nil), nil
 }
 
 func emailConsumer(name string) app.Consumer {

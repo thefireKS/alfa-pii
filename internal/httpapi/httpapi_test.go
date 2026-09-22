@@ -18,7 +18,7 @@ import (
 func newTestHandler(maxActive int, maxBody int64) *Handler {
 	st := store.NewMemory(store.Limits{MaxEntries: 100, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: 0, CreateWait: time.Second})
 	svc := app.New([]app.Recognizer{recognizer.EmailRecognizer{}}, st, masker.New("PII"))
-	return NewHandler(svc, nil, func() bool { return true }, maxActive, maxBody)
+	return NewHandler(svc, nil, func() bool { return true }, maxActive, maxBody, nil, nil)
 }
 
 // newAllHandler builds a handler wired with every supported recognizer.
@@ -36,7 +36,7 @@ func newAllHandler(maxActive int, maxBody int64) *Handler {
 		recognizer.CVVRecognizer{},
 	}
 	svc := app.New(recs, st, masker.New("PII"))
-	return NewHandler(svc, nil, func() bool { return true }, maxActive, maxBody)
+	return NewHandler(svc, nil, func() bool { return true }, maxActive, maxBody, nil, nil)
 }
 
 func doPost(t *testing.T, h *Handler, body string) *httptest.ResponseRecorder {
@@ -274,7 +274,7 @@ func TestLivezReadyz(t *testing.T) {
 func TestReadyzNotReady(t *testing.T) {
 	st := store.NewMemory(store.Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: 0, CreateWait: time.Second})
 	svc := app.New([]app.Recognizer{recognizer.EmailRecognizer{}}, st, masker.New("PII"))
-	h := NewHandler(svc, nil, func() bool { return false }, 10, 1<<20)
+	h := NewHandler(svc, nil, func() bool { return false }, 10, 1<<20, nil, nil)
 	rec := httptest.NewRecorder()
 	h.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	if rec.Code != http.StatusServiceUnavailable {

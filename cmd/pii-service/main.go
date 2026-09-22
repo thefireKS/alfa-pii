@@ -14,6 +14,7 @@ import (
 	"alfa-hackathon.local/pii/internal/config"
 	"alfa-hackathon.local/pii/internal/httpapi"
 	"alfa-hackathon.local/pii/internal/masker"
+	"alfa-hackathon.local/pii/internal/metrics"
 	"alfa-hackathon.local/pii/internal/recognizer"
 	"alfa-hackathon.local/pii/internal/store"
 )
@@ -80,6 +81,7 @@ func main() {
 	}
 
 	m := masker.New(cfg.MarkerPrefix)
+	met := metrics.New()
 	st := store.NewMemory(store.Limits{
 		MaxEntries:      cfg.StoreMaxEntries,
 		MaxBytes:        cfg.StoreMaxBytes,
@@ -88,6 +90,7 @@ func main() {
 		CreateWait:      cfg.StoreCreateWait,
 		CleanupInterval: cfg.StoreCleanupInterval,
 	})
+	st.SetObserver(storeObserver{met})
 	st.StartCleanup()
 	defer st.Stop()
 	svc, err := app.NewManaged(reg, processTypes, consumers, st, m)
@@ -98,7 +101,7 @@ func main() {
 
 	ready := func() bool { return true }
 	auth := httpapi.NewAuthenticator(secrets)
-	h := httpapi.NewHandler(svc, auth, ready, cfg.MaxActiveRequests, cfg.MaxBodyBytes)
+	h := httpapi.NewHandler(svc, auth, ready, cfg.MaxActiveRequests, cfg.MaxBodyBytes, logger, met)
 
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,
@@ -133,4 +136,19 @@ func main() {
 		}
 	}
 	logger.Info("stopped")
+}
+
+// storeObserver forwards store lifecycle events to the metrics collectors.
+type storeObserver struct {
+	met *metrics.Metrics
+}
+
+func (o storeObserver) RecordAdded()   { o.met.StoreRecordAdded() }
+func (o storeObserver) RecordRemoved() { o.met.StoreRecordRemoved() }
+func (o storeObserver) BytesDelta(d int64) {
+	o.met.StoreBytesDelta(d)
+}
+func (o storeObserver) TTLExpired() { o.met.StoreTTLExpired() }
+func (o storeObserver) Failure(reason string) {
+	o.met.StoreFailure(reason)
 }

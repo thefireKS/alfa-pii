@@ -130,7 +130,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "build main service:", err)
 		os.Exit(1)
 	}
-	mainServer := httptest.NewServer(httpapi.NewHandler(mainSvc, httpapi.NewAuthenticator(secrets), func() bool { return true }, 10, 1<<20).Routes())
+	mainServer := httptest.NewServer(httpapi.NewHandler(mainSvc, httpapi.NewAuthenticator(secrets), func() bool { return true }, 10, 1<<20, nil, nil).Routes())
 	defer mainServer.Close()
 
 	// Boom service: the same registry with the email recognizer overridden to
@@ -141,7 +141,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "build boom service:", err)
 		os.Exit(1)
 	}
-	boomServer := httptest.NewServer(httpapi.NewHandler(boomSvc, httpapi.NewAuthenticator(map[string]string{"boom-secret": "boom"}), func() bool { return true }, 10, 1<<20).Routes())
+	boomServer := httptest.NewServer(httpapi.NewHandler(boomSvc, httpapi.NewAuthenticator(map[string]string{"boom-secret": "boom"}), func() bool { return true }, 10, 1<<20, nil, nil).Routes())
 	defer boomServer.Close()
 
 	ctx := context.Background()

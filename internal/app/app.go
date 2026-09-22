@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"alfa-hackathon.local/pii/internal/masker"
 	"alfa-hackathon.local/pii/internal/recognizer"
@@ -53,6 +54,25 @@ const (
 // /process a single fixed scope is used and is never chosen from request
 // headers or fields.
 const ConsumerScope = "process"
+
+// loggerKey is the context key for a request-scoped logger carrying the
+// technical request identifier. It is stored separately from the user-supplied
+// payload_id so logs never expose the payload identifier.
+type loggerKey struct{}
+
+// WithLogger returns a context carrying the request-scoped logger.
+func WithLogger(ctx context.Context, l *slog.Logger) context.Context {
+	return context.WithValue(ctx, loggerKey{}, l)
+}
+
+// loggerFrom returns the request-scoped logger from ctx, or the default logger
+// when none is set.
+func loggerFrom(ctx context.Context) *slog.Logger {
+	if l, ok := ctx.Value(loggerKey{}).(*slog.Logger); ok && l != nil {
+		return l
+	}
+	return slog.Default()
+}
 
 // Consumer is the runtime policy for one consumer system. It is passed
 // explicitly between layers so it is never lost.
@@ -143,37 +163,65 @@ type Result struct {
 	// Text is the masked text for a mask operation, or the restored text for
 	// a restore operation.
 	Text string
+	// Outcome classifies the result for observability: a new mask, a
+	// restoration, or a repeat of a stored result.
+	Outcome Outcome
 }
+
+// Outcome classifies the result of an operation for observability. The set is
+// fixed and bounded.
+type Outcome string
+
+const (
+	// OutcomeMask means a new mask was created.
+	OutcomeMask Outcome = "mask"
+	// OutcomeRestore means a restoration was performed.
+	OutcomeRestore Outcome = "restore"
+	// OutcomeRepeat means a stored result was returned for a repeat of the
+	// original or mask.
+	OutcomeRepeat Outcome = "repeat"
+)
 
 // Process handles one payload for the given payloadID in the fixed /process
 // scope. It returns the masked text for a new original, the restored original
 // for a repeated mask, or ErrConflict when the text matches neither.
 func (s *Service) Process(ctx context.Context, payloadID, payload string) (Result, error) {
+	log := loggerFrom(ctx)
 	key := ConsumerScope + ":" + payloadID
 
 	rec, ok := s.store.Get(key)
 	if !ok {
+		log.Info("stage", "stage", "operation", "direction", "mask_new")
+		var created bool
 		var err error
-		rec, err = s.create(ctx, key, func(ctx context.Context) (store.Record, error) {
+		rec, created, err = s.create(ctx, key, func(ctx context.Context) (store.Record, error) {
 			if err := ctx.Err(); err != nil {
 				return store.Record{}, err
 			}
-			masked, table, err := s.mask(payload)
+			masked, table, types, err := s.mask(payload)
 			if err != nil {
 				return store.Record{}, err
 			}
+			log.Info("stage", "stage", "recognition", "types", types)
+			log.Info("stage", "stage", "replacement", "types", types)
 			return store.Record{Original: payload, Masked: masked, Table: toStoreTable(table), Format: FormatMarker}, nil
 		})
 		if err != nil {
 			return Result{}, err
 		}
+		log.Info("stage", "stage", "storage")
+		if created {
+			return Result{Text: rec.Masked, Outcome: OutcomeMask}, nil
+		}
 	}
 
 	switch {
 	case payload == rec.Original:
-		return Result{Text: rec.Masked}, nil
+		log.Info("stage", "stage", "operation", "direction", "mask_repeat")
+		return Result{Text: rec.Masked, Outcome: OutcomeRepeat}, nil
 	case payload == rec.Masked:
-		return Result{Text: rec.Original}, nil
+		log.Info("stage", "stage", "operation", "direction", "restore")
+		return Result{Text: rec.Original, Outcome: OutcomeRestore}, nil
 	default:
 		return Result{}, ErrConflict
 	}
@@ -184,6 +232,7 @@ func (s *Service) Process(ctx context.Context, payloadID, payload string) (Resul
 // switches to demasking when presented with a previously issued mask. Current
 // access rights (enabled, masking enabled) are checked on every call.
 func (s *Service) Mask(ctx context.Context, consumerName, payloadID, payload string) (Result, error) {
+	log := loggerFrom(ctx)
 	c, err := s.consumer(consumerName)
 	if err != nil {
 		return Result{}, err
@@ -195,29 +244,39 @@ func (s *Service) Mask(ctx context.Context, consumerName, payloadID, payload str
 
 	rec, ok := s.store.Get(key)
 	if !ok {
+		log.Info("stage", "stage", "operation", "direction", "mask_new")
+		var created bool
 		var err error
-		rec, err = s.create(ctx, key, func(ctx context.Context) (store.Record, error) {
+		rec, created, err = s.create(ctx, key, func(ctx context.Context) (store.Record, error) {
 			if err := ctx.Err(); err != nil {
 				return store.Record{}, err
 			}
-			masked, table, err := s.maskFor(c, payload)
+			masked, table, types, err := s.maskFor(c, payload)
 			if err != nil {
 				return store.Record{}, err
 			}
+			log.Info("stage", "stage", "recognition", "types", types)
+			log.Info("stage", "stage", "replacement", "types", types)
 			return store.Record{Original: payload, Masked: masked, Table: toStoreTable(table), Format: c.MaskFormat}, nil
 		})
 		if err != nil {
 			return Result{}, err
 		}
+		log.Info("stage", "stage", "storage")
+		if created {
+			return Result{Text: rec.Masked, Outcome: OutcomeMask}, nil
+		}
 	}
 
 	switch {
 	case payload == rec.Original:
-		return Result{Text: rec.Masked}, nil
+		log.Info("stage", "stage", "operation", "direction", "mask_repeat")
+		return Result{Text: rec.Masked, Outcome: OutcomeRepeat}, nil
 	case payload == rec.Masked:
 		// The endpoint is mask: a repeated mask stays a mask and is never
 		// switched to demasking.
-		return Result{Text: rec.Masked}, nil
+		log.Info("stage", "stage", "operation", "direction", "mask_repeat")
+		return Result{Text: rec.Masked, Outcome: OutcomeRepeat}, nil
 	default:
 		return Result{}, ErrConflict
 	}
@@ -229,6 +288,7 @@ func (s *Service) Mask(ctx context.Context, consumerName, payloadID, payload str
 // wholesale instead of substitution. Current access rights (enabled, restore
 // right) are checked on every call.
 func (s *Service) Restore(ctx context.Context, consumerName, payloadID, masked string) (Result, error) {
+	log := loggerFrom(ctx)
 	c, err := s.consumer(consumerName)
 	if err != nil {
 		return Result{}, err
@@ -250,11 +310,13 @@ func (s *Service) Restore(ctx context.Context, consumerName, payloadID, masked s
 		if masked != rec.Masked {
 			return Result{}, ErrConflict
 		}
-		return Result{Text: rec.Original}, nil
+		log.Info("stage", "stage", "restoration")
+		return Result{Text: rec.Original, Outcome: OutcomeRestore}, nil
 	default:
 		// Marker format: substitute the consumer's own markers inside the
 		// given text. Markers not in the table are left untouched.
-		return Result{Text: masker.Restore(masked, fromStoreTable(rec.Table))}, nil
+		log.Info("stage", "stage", "restoration")
+		return Result{Text: masker.Restore(masked, fromStoreTable(rec.Table)), Outcome: OutcomeRestore}, nil
 	}
 }
 
@@ -273,76 +335,82 @@ func (s *Service) consumer(name string) (Consumer, error) {
 
 // mask runs all recognizers, resolves overlaps and replaces the found
 // fragments. A recognition or resolution failure is returned so the operation
-// fails closed and no partially masked text is produced.
-func (s *Service) mask(text string) (string, []masker.Replacement, error) {
+// fails closed and no partially masked text is produced. It returns the masked
+// text, the replacement table and the distinct entity types found.
+func (s *Service) mask(text string) (string, []masker.Replacement, []recognizer.Type, error) {
 	var frags []recognizer.Fragment
 	for _, r := range s.recognizers {
 		fs, err := r.Find(text)
 		if err != nil {
-			return "", nil, fmt.Errorf("recognize %s: %w", r.Type(), err)
+			return "", nil, nil, fmt.Errorf("recognize %s: %w", r.Type(), err)
 		}
 		frags = append(frags, fs...)
 	}
 	resolved, err := recognizer.Resolve(text, frags)
 	if err != nil {
-		return "", nil, fmt.Errorf("resolve fragments: %w", err)
+		return "", nil, nil, fmt.Errorf("resolve fragments: %w", err)
 	}
 	ranges := make([]masker.Range, 0, len(resolved))
+	types := make([]recognizer.Type, 0, len(resolved))
 	for _, f := range resolved {
 		ranges = append(ranges, masker.Range{Start: f.Start, End: f.End})
+		types = append(types, f.Type)
 	}
 	masked, table := s.masker.Mask(text, ranges)
-	return masked, table, nil
+	return masked, table, types, nil
 }
 
 // maskFor masks text for a consumer using its configured types and format.
-func (s *Service) maskFor(c Consumer, text string) (string, []masker.Replacement, error) {
+func (s *Service) maskFor(c Consumer, text string) (string, []masker.Replacement, []recognizer.Type, error) {
 	if s.registry == nil {
-		return "", nil, errors.New("registry not configured")
+		return "", nil, nil, errors.New("registry not configured")
 	}
 	recs, priority, err := s.registry.Recognizers(c.Types)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	var frags []recognizer.Fragment
 	for _, r := range recs {
 		fs, err := r.Find(text)
 		if err != nil {
-			return "", nil, fmt.Errorf("recognize %s: %w", r.Type(), err)
+			return "", nil, nil, fmt.Errorf("recognize %s: %w", r.Type(), err)
 		}
 		frags = append(frags, fs...)
 	}
 	resolved, err := recognizer.ResolveWithPriority(text, frags, priority)
 	if err != nil {
-		return "", nil, fmt.Errorf("resolve fragments: %w", err)
+		return "", nil, nil, fmt.Errorf("resolve fragments: %w", err)
 	}
 	ranges := make([]masker.Range, 0, len(resolved))
+	types := make([]recognizer.Type, 0, len(resolved))
 	for _, f := range resolved {
 		ranges = append(ranges, masker.Range{Start: f.Start, End: f.End})
+		types = append(types, f.Type)
 	}
 	if c.MaskFormat == FormatStars {
 		masked, table := masker.Stars(text, ranges)
-		return masked, table, nil
+		return masked, table, types, nil
 	}
 	masked, table := s.masker.Mask(text, ranges)
-	return masked, table, nil
+	return masked, table, types, nil
 }
 
 // create inserts a new record, mapping capacity and busy errors to the
-// application-level errors.
-func (s *Service) create(ctx context.Context, key string, build func(context.Context) (store.Record, error)) (store.Record, error) {
-	createdRec, _, err := s.store.Create(ctx, key, build)
+// application-level errors. It reports whether this call created the record
+// (true) or another goroutine published it first (false).
+func (s *Service) create(ctx context.Context, key string, build func(context.Context) (store.Record, error)) (store.Record, bool, error) {
+	createdRec, created, err := s.store.Create(ctx, key, build)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrCapacity):
-			return store.Record{}, ErrCapacity
+			return store.Record{}, false, ErrCapacity
 		case errors.Is(err, store.ErrBusy):
-			return store.Record{}, ErrBusy
+			return store.Record{}, false, ErrBusy
 		default:
-			return store.Record{}, fmt.Errorf("create correspondence: %w", err)
+			return store.Record{}, false, fmt.Errorf("create correspondence: %w", err)
 		}
 	}
-	return createdRec, nil
+	return createdRec, created, nil
 }
 
 func toStoreTable(table []masker.Replacement) []store.Replacement {

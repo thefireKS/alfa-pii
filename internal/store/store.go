@@ -20,6 +20,12 @@ var ErrCapacity = errors.New("store capacity exceeded")
 // same key to publish its result.
 var ErrBusy = errors.New("store busy creating key")
 
+// Failure reasons reported to the observer.
+const (
+	StoreFailCapacity = "capacity"
+	StoreFailBusy     = "busy"
+)
+
 // Record is a stored correspondence for one key.
 type Record struct {
 	// Original is the unmasked text.
@@ -91,6 +97,25 @@ type inflight struct {
 	err  error
 }
 
+// Observer receives store lifecycle events for observability. It is optional;
+// a nil observer disables reporting. Implementations must be safe for
+// concurrent use because events are reported from multiple goroutines. The
+// interface is declared here because the store is the caller of the observer.
+type Observer interface {
+	// RecordAdded is called when a new correspondence is published.
+	RecordAdded()
+	// RecordRemoved is called when a correspondence is evicted.
+	RecordRemoved()
+	// BytesDelta adjusts the accounted store bytes by delta.
+	BytesDelta(delta int64)
+	// TTLExpired is called when a correspondence is evicted because its TTL
+	// elapsed.
+	TTLExpired()
+	// Failure is called when the store refuses an operation for the given
+	// reason (capacity or busy).
+	Failure(reason string)
+}
+
 // Memory is a concurrency-safe in-memory Store.
 type Memory struct {
 	mu       sync.Mutex
@@ -99,6 +124,7 @@ type Memory struct {
 	limits   Limits
 	now      func() time.Time
 	inflight map[string]*inflight
+	obs      Observer
 
 	stopCh  chan struct{}
 	doneCh  chan struct{}
@@ -113,6 +139,14 @@ func NewMemory(limits Limits) *Memory {
 		now:      time.Now,
 		inflight: make(map[string]*inflight),
 	}
+}
+
+// SetObserver attaches an optional observer for lifecycle events. It must be
+// called before the store is used concurrently.
+func (s *Memory) SetObserver(o Observer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.obs = o
 }
 
 // Get implements Store.
@@ -174,12 +208,14 @@ func (s *Memory) Create(ctx context.Context, key string, build func(context.Cont
 		if size > s.limits.MaxRecordBytes || s.bytes+size > s.limits.MaxBytes || len(s.entries) >= s.limits.MaxEntries {
 			s.mu.Unlock()
 			s.finishInflight(key, inf, Record{}, ErrCapacity)
+			s.reportFailure(StoreFailCapacity)
 			return Record{}, false, ErrCapacity
 		}
 		s.entries[key] = rec
 		s.bytes += size
 		s.mu.Unlock()
 		s.finishInflight(key, inf, rec, nil)
+		s.reportAdded(size)
 		return rec, true, nil
 	}
 }
@@ -204,6 +240,7 @@ func (s *Memory) waitInflight(ctx context.Context, inf *inflight) (Record, bool,
 	case <-ctx.Done():
 		return Record{}, false, ctx.Err()
 	case <-timeout:
+		s.reportFailure(StoreFailBusy)
 		return Record{}, false, ErrBusy
 	}
 }
@@ -275,8 +312,48 @@ func (s *Memory) evictExpired() {
 		if rec.CreatedAt.Before(cutoff) {
 			s.bytes -= recordSize(rec)
 			delete(s.entries, k)
+			s.reportRemoved(recordSize(rec))
+			s.reportTTLExpired()
 		}
 	}
+}
+
+// reportAdded notifies the observer that a record was published. It must be
+// called without the mutex held.
+func (s *Memory) reportAdded(size int64) {
+	if s.obs == nil {
+		return
+	}
+	s.obs.RecordAdded()
+	s.obs.BytesDelta(size)
+}
+
+// reportRemoved notifies the observer that a record was evicted. It must be
+// called without the mutex held.
+func (s *Memory) reportRemoved(size int64) {
+	if s.obs == nil {
+		return
+	}
+	s.obs.RecordRemoved()
+	s.obs.BytesDelta(-size)
+}
+
+// reportTTLExpired notifies the observer of a TTL eviction. It must be called
+// without the mutex held.
+func (s *Memory) reportTTLExpired() {
+	if s.obs == nil {
+		return
+	}
+	s.obs.TTLExpired()
+}
+
+// reportFailure notifies the observer of a storage failure. It must be called
+// without the mutex held.
+func (s *Memory) reportFailure(reason string) {
+	if s.obs == nil {
+		return
+	}
+	s.obs.Failure(reason)
 }
 
 // recordSize estimates the bytes a record occupies in memory, including the

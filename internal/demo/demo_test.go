@@ -26,7 +26,7 @@ func testServer(t *testing.T, consumers []app.Consumer, secrets map[string]strin
 	if err != nil {
 		t.Fatalf("NewManaged: %v", err)
 	}
-	srv := httptest.NewServer(httpapi.NewHandler(svc, httpapi.NewAuthenticator(secrets), func() bool { return true }, 10, 1<<20).Routes())
+	srv := httptest.NewServer(httpapi.NewHandler(svc, httpapi.NewAuthenticator(secrets), func() bool { return true }, 10, 1<<20, nil, nil).Routes())
 	t.Cleanup(srv.Close)
 	return srv.URL
 }
