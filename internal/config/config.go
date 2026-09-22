@@ -35,8 +35,16 @@ type Config struct {
 	StoreMaxEntries int
 	// StoreMaxBytes caps the total bytes held by stored correspondences.
 	StoreMaxBytes int64
+	// StoreMaxRecordBytes caps the estimated bytes of a single correspondence.
+	StoreMaxRecordBytes int64
 	// StoreTTL is how long a correspondence is kept after creation.
 	StoreTTL time.Duration
+	// StoreCreateWait is the maximum time a request waits for another request
+	// creating the same key before the store reports it busy.
+	StoreCreateWait time.Duration
+	// StoreCleanupInterval is how often the background cleanup evicts expired
+	// correspondences.
+	StoreCleanupInterval time.Duration
 
 	// MarkerPrefix is the prefix used for generated replacement markers.
 	MarkerPrefix string
@@ -45,17 +53,20 @@ type Config struct {
 // Default returns a Config populated with documented default values.
 func Default() Config {
 	return Config{
-		ListenAddr:        ":8080",
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		ShutdownTimeout:   10 * time.Second,
-		MaxBodyBytes:      1 << 20, // 1 MiB
-		MaxActiveRequests: 200,
-		StoreMaxEntries:   100_000,
-		StoreMaxBytes:     64 << 20, // 64 MiB
-		StoreTTL:          24 * time.Hour,
-		MarkerPrefix:      "PII",
+		ListenAddr:           ":8080",
+		ReadTimeout:          10 * time.Second,
+		WriteTimeout:         10 * time.Second,
+		IdleTimeout:          60 * time.Second,
+		ShutdownTimeout:      10 * time.Second,
+		MaxBodyBytes:         1 << 20, // 1 MiB
+		MaxActiveRequests:    200,
+		StoreMaxEntries:      100_000,
+		StoreMaxBytes:        64 << 20, // 64 MiB
+		StoreMaxRecordBytes:  1 << 20,  // 1 MiB per record
+		StoreTTL:             24 * time.Hour,
+		StoreCreateWait:      5 * time.Second,
+		StoreCleanupInterval: time.Minute,
+		MarkerPrefix:         "PII",
 	}
 }
 
@@ -124,12 +135,33 @@ func Load() (Config, error) {
 		}
 		cfg.StoreMaxBytes = n
 	}
+	if v := os.Getenv("PII_STORE_MAX_RECORD_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return Config{}, fmt.Errorf("PII_STORE_MAX_RECORD_BYTES: %w", err)
+		}
+		cfg.StoreMaxRecordBytes = n
+	}
 	if v := os.Getenv("PII_STORE_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return Config{}, fmt.Errorf("PII_STORE_TTL: %w", err)
 		}
 		cfg.StoreTTL = d
+	}
+	if v := os.Getenv("PII_STORE_CREATE_WAIT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("PII_STORE_CREATE_WAIT: %w", err)
+		}
+		cfg.StoreCreateWait = d
+	}
+	if v := os.Getenv("PII_STORE_CLEANUP_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("PII_STORE_CLEANUP_INTERVAL: %w", err)
+		}
+		cfg.StoreCleanupInterval = d
 	}
 	if v := os.Getenv("PII_MARKER_PREFIX"); v != "" {
 		cfg.MarkerPrefix = v
@@ -172,8 +204,17 @@ func (c Config) Validate() error {
 	if c.StoreMaxBytes <= 0 {
 		errs = append(errs, errors.New("store max bytes must be positive"))
 	}
+	if c.StoreMaxRecordBytes <= 0 {
+		errs = append(errs, errors.New("store max record bytes must be positive"))
+	}
 	if c.StoreTTL <= 0 {
 		errs = append(errs, errors.New("store TTL must be positive"))
+	}
+	if c.StoreCreateWait <= 0 {
+		errs = append(errs, errors.New("store create wait must be positive"))
+	}
+	if c.StoreCleanupInterval <= 0 {
+		errs = append(errs, errors.New("store cleanup interval must be positive"))
 	}
 	if c.MarkerPrefix == "" {
 		errs = append(errs, errors.New("marker prefix must not be empty"))

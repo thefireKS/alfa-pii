@@ -110,6 +110,8 @@ func (h *Handler) handleProcess(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "text conflicts with existing correspondence")
 		case errors.Is(err, app.ErrCapacity):
 			writeRetryAfter(w, "storage capacity exceeded")
+		case errors.Is(err, app.ErrBusy):
+			writeRetryAfter(w, "storage busy creating key")
 		default:
 			writeError(w, http.StatusInternalServerError, "internal error")
 		}

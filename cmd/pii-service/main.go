@@ -28,14 +28,29 @@ func main() {
 	}
 
 	// Wire dependencies explicitly at the entry point.
-	rec := recognizer.EmailRecognizer{}
+	recs := []app.Recognizer{
+		recognizer.EmailRecognizer{},
+		recognizer.PhoneRecognizer{},
+		recognizer.INNRecognizer{},
+		recognizer.CardRecognizer{},
+		recognizer.PassportRecognizer{},
+		recognizer.DepartmentCodeRecognizer{},
+		recognizer.DriverLicenseRecognizer{},
+		recognizer.PINRecognizer{},
+		recognizer.CVVRecognizer{},
+	}
 	m := masker.New(cfg.MarkerPrefix)
 	st := store.NewMemory(store.Limits{
-		MaxEntries: cfg.StoreMaxEntries,
-		MaxBytes:   cfg.StoreMaxBytes,
-		TTL:        cfg.StoreTTL,
+		MaxEntries:      cfg.StoreMaxEntries,
+		MaxBytes:        cfg.StoreMaxBytes,
+		MaxRecordBytes:  cfg.StoreMaxRecordBytes,
+		TTL:             cfg.StoreTTL,
+		CreateWait:      cfg.StoreCreateWait,
+		CleanupInterval: cfg.StoreCleanupInterval,
 	})
-	svc := app.New([]app.Recognizer{rec}, st, m)
+	st.StartCleanup()
+	defer st.Stop()
+	svc := app.New(recs, st, m)
 
 	ready := func() bool { return true }
 	h := httpapi.NewHandler(svc, ready, cfg.MaxActiveRequests, cfg.MaxBodyBytes)

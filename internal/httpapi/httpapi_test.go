@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"alfa-hackathon.local/pii/internal/app"
 	"alfa-hackathon.local/pii/internal/masker"
@@ -15,8 +16,26 @@ import (
 )
 
 func newTestHandler(maxActive int, maxBody int64) *Handler {
-	st := store.NewMemory(store.Limits{MaxEntries: 100, MaxBytes: 1 << 20, TTL: 0})
+	st := store.NewMemory(store.Limits{MaxEntries: 100, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: 0, CreateWait: time.Second})
 	svc := app.New([]app.Recognizer{recognizer.EmailRecognizer{}}, st, masker.New("PII"))
+	return NewHandler(svc, func() bool { return true }, maxActive, maxBody)
+}
+
+// newAllHandler builds a handler wired with every supported recognizer.
+func newAllHandler(maxActive int, maxBody int64) *Handler {
+	st := store.NewMemory(store.Limits{MaxEntries: 100, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: 0, CreateWait: time.Second})
+	recs := []app.Recognizer{
+		recognizer.EmailRecognizer{},
+		recognizer.PhoneRecognizer{},
+		recognizer.INNRecognizer{},
+		recognizer.CardRecognizer{},
+		recognizer.PassportRecognizer{},
+		recognizer.DepartmentCodeRecognizer{},
+		recognizer.DriverLicenseRecognizer{},
+		recognizer.PINRecognizer{},
+		recognizer.CVVRecognizer{},
+	}
+	svc := app.New(recs, st, masker.New("PII"))
 	return NewHandler(svc, func() bool { return true }, maxActive, maxBody)
 }
 
@@ -68,6 +87,54 @@ func TestProcessFullCycle(t *testing.T) {
 	}
 	if got := decodeResult(t, rec3); got != original {
 		t.Fatalf("restore = %q, want %q", got, original)
+	}
+}
+
+// TestProcessFullCycleAllCategories verifies the full HTTP mask -> restore
+// cycle for every supported category.
+func TestProcessFullCycleAllCategories(t *testing.T) {
+	h := newAllHandler(10, 1<<20)
+	tests := []struct {
+		name     string
+		original string
+		leak     string
+	}{
+		{name: "email", original: "почта a.b@example.com", leak: "a.b@example.com"},
+		{name: "phone", original: "тел +7 (912) 345-67-89", leak: "+7 (912) 345-67-89"},
+		{name: "inn", original: "ИНН 7707083893", leak: "7707083893"},
+		{name: "card", original: "карта 4111 1111 1111 1111", leak: "4111 1111 1111 1111"},
+		{name: "passport", original: "паспорт 4506 123456", leak: "4506 123456"},
+		{name: "department", original: "код подразделения 770-123", leak: "770-123"},
+		{name: "driver license", original: "водительское удостоверение 7701 123456", leak: "7701 123456"},
+		{name: "pin", original: "ПИН 1234", leak: "1234"},
+		{name: "cvv", original: "CVV 123", leak: "123"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := "id-" + tt.name
+			body, _ := json.Marshal(processRequest{Payload: tt.original, PayloadID: id})
+			rec := doPost(t, h, string(body))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("mask status = %d, body=%q", rec.Code, rec.Body.String())
+			}
+			masked := decodeResult(t, rec)
+			if masked == tt.original || strings.Contains(masked, tt.leak) {
+				t.Fatalf("masked = %q", masked)
+			}
+			// Repeat of original returns the same mask.
+			rec2 := doPost(t, h, string(body))
+			if got := decodeResult(t, rec2); got != masked {
+				t.Fatalf("repeat = %q, want %q", got, masked)
+			}
+			// Repeat of mask returns the exact original.
+			rec3 := doPost(t, h, `{"payload":"`+masked+`","payload_id":"`+id+`"}`)
+			if rec3.Code != http.StatusOK {
+				t.Fatalf("restore status = %d, body=%q", rec3.Code, rec3.Body.String())
+			}
+			if got := decodeResult(t, rec3); got != tt.original {
+				t.Fatalf("restore = %q, want %q", got, tt.original)
+			}
+		})
 	}
 }
 
@@ -205,7 +272,7 @@ func TestLivezReadyz(t *testing.T) {
 }
 
 func TestReadyzNotReady(t *testing.T) {
-	st := store.NewMemory(store.Limits{MaxEntries: 10, MaxBytes: 1 << 20, TTL: 0})
+	st := store.NewMemory(store.Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: 0, CreateWait: time.Second})
 	svc := app.New([]app.Recognizer{recognizer.EmailRecognizer{}}, st, masker.New("PII"))
 	h := NewHandler(svc, func() bool { return false }, 10, 1<<20)
 	rec := httptest.NewRecorder()

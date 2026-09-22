@@ -17,7 +17,10 @@ func TestEmailFind(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			frags := r.Find(tt.in)
+			frags, err := r.Find(tt.in)
+			if err != nil {
+				t.Fatalf("find: %v", err)
+			}
 			got := make([]string, 0, len(frags))
 			for _, f := range frags {
 				if f.Type != Email {
@@ -41,7 +44,10 @@ func TestEmailByteOffsets(t *testing.T) {
 	r := EmailRecognizer{}
 	// Cyrillic prefix shifts byte offsets relative to rune offsets.
 	in := "почта: a@b.ru"
-	frags := r.Find(in)
+	frags, err := r.Find(in)
+	if err != nil {
+		t.Fatalf("find: %v", err)
+	}
 	if len(frags) != 1 {
 		t.Fatalf("got %d fragments, want 1", len(frags))
 	}

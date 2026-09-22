@@ -20,6 +20,10 @@ var ErrConflict = errors.New("text conflicts with existing correspondence")
 // ErrCapacity is returned when the store cannot hold a new correspondence.
 var ErrCapacity = errors.New("store capacity exceeded")
 
+// ErrBusy is returned when creating a correspondence for a key that another
+// request is already creating takes longer than the configured wait limit.
+var ErrBusy = errors.New("store busy creating key")
+
 // ConsumerScope is the internal key dimension "consumer + payload_id". For
 // /process a single fixed scope is used and is never chosen from request
 // headers or fields.
@@ -28,13 +32,13 @@ const ConsumerScope = "process"
 // Recognizer is the recognition dependency used by the application.
 type Recognizer interface {
 	Type() recognizer.Type
-	Find(text string) []recognizer.Fragment
+	Find(text string) ([]recognizer.Fragment, error)
 }
 
 // Store is the storage dependency used by the application.
 type Store interface {
 	Get(key string) (store.Record, bool)
-	Create(key string, rec store.Record) (store.Record, bool, error)
+	Create(ctx context.Context, key string, build func(context.Context) (store.Record, error)) (store.Record, bool, error)
 }
 
 // Service implements the process operation.
@@ -58,22 +62,28 @@ type Result struct {
 
 // Process handles one payload for the given payloadID. It returns the masked
 // text for a new original, the restored original for a repeated mask, or
-// ErrConflict when the text matches neither.
+// ErrConflict when the text matches neither. Recognition runs only for the
+// request that wins the per-key reservation; concurrent requests for the same
+// key wait for the winner and observe the same published record.
 func (s *Service) Process(ctx context.Context, payloadID, payload string) (Result, error) {
 	key := ConsumerScope + ":" + payloadID
 
 	rec, ok := s.store.Get(key)
 	if !ok {
-		masked, table := s.mask(payload)
-		newRec := store.Record{Original: payload, Masked: masked, Table: toStoreTable(table)}
-		createdRec, created, err := s.create(ctx, key, newRec)
+		var err error
+		rec, err = s.create(ctx, key, func(ctx context.Context) (store.Record, error) {
+			if err := ctx.Err(); err != nil {
+				return store.Record{}, err
+			}
+			masked, table, err := s.mask(payload)
+			if err != nil {
+				return store.Record{}, err
+			}
+			return store.Record{Original: payload, Masked: masked, Table: toStoreTable(table)}, nil
+		})
 		if err != nil {
 			return Result{}, err
 		}
-		if created {
-			return Result{Text: masked}, nil
-		}
-		rec = createdRec
 	}
 
 	switch {
@@ -86,27 +96,45 @@ func (s *Service) Process(ctx context.Context, payloadID, payload string) (Resul
 	}
 }
 
-// mask runs all recognizers and replaces the found fragments.
-func (s *Service) mask(text string) (string, []masker.Replacement) {
-	var ranges []masker.Range
+// mask runs all recognizers, resolves overlaps and replaces the found
+// fragments. A recognition or resolution failure is returned so the operation
+// fails closed and no partially masked text is produced.
+func (s *Service) mask(text string) (string, []masker.Replacement, error) {
+	var frags []recognizer.Fragment
 	for _, r := range s.recognizers {
-		for _, f := range r.Find(text) {
-			ranges = append(ranges, masker.Range{Start: f.Start, End: f.End})
+		fs, err := r.Find(text)
+		if err != nil {
+			return "", nil, fmt.Errorf("recognize %s: %w", r.Type(), err)
 		}
+		frags = append(frags, fs...)
 	}
-	return s.masker.Mask(text, ranges)
+	resolved, err := recognizer.Resolve(text, frags)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve fragments: %w", err)
+	}
+	ranges := make([]masker.Range, 0, len(resolved))
+	for _, f := range resolved {
+		ranges = append(ranges, masker.Range{Start: f.Start, End: f.End})
+	}
+	masked, table := s.masker.Mask(text, ranges)
+	return masked, table, nil
 }
 
-// create inserts a new record, mapping capacity errors to ErrCapacity.
-func (s *Service) create(ctx context.Context, key string, rec store.Record) (store.Record, bool, error) {
-	createdRec, created, err := s.store.Create(key, rec)
+// create inserts a new record, mapping capacity and busy errors to the
+// application-level errors.
+func (s *Service) create(ctx context.Context, key string, build func(context.Context) (store.Record, error)) (store.Record, error) {
+	createdRec, _, err := s.store.Create(ctx, key, build)
 	if err != nil {
-		if errors.Is(err, store.ErrCapacity) {
-			return store.Record{}, false, ErrCapacity
+		switch {
+		case errors.Is(err, store.ErrCapacity):
+			return store.Record{}, ErrCapacity
+		case errors.Is(err, store.ErrBusy):
+			return store.Record{}, ErrBusy
+		default:
+			return store.Record{}, fmt.Errorf("create correspondence: %w", err)
 		}
-		return store.Record{}, false, fmt.Errorf("create correspondence: %w", err)
 	}
-	return createdRec, created, nil
+	return createdRec, nil
 }
 
 func toStoreTable(table []masker.Replacement) []store.Replacement {
