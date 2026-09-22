@@ -29,6 +29,14 @@ func allRecognizers() []Recognizer {
 		recognizer.DriverLicenseRecognizer{},
 		recognizer.PINRecognizer{},
 		recognizer.CVVRecognizer{},
+		recognizer.FullNameRecognizer{},
+		recognizer.BirthDateRecognizer{},
+		recognizer.BirthPlaceRecognizer{},
+		recognizer.CitizenshipRecognizer{},
+		recognizer.PassportAuthorityRecognizer{},
+		recognizer.PassportIssueDateRecognizer{},
+		recognizer.AddressRecognizer{},
+		recognizer.CardHolderNameRecognizer{},
 	}
 }
 
@@ -56,6 +64,14 @@ func TestProcessAllCategories(t *testing.T) {
 		{name: "driver license", original: "водительское удостоверение 7701 123456", leak: "7701 123456"},
 		{name: "pin", original: "ПИН 1234", leak: "1234"},
 		{name: "cvv", original: "CVV 123", leak: "123"},
+		{name: "full name", original: "ФИО: Иванов Иван Иванович", leak: "Иванов Иван Иванович"},
+		{name: "birth date", original: "дата рождения: 12.03.1990", leak: "12.03.1990"},
+		{name: "birth place", original: "место рождения: г. Москва", leak: "г. Москва"},
+		{name: "citizenship", original: "гражданство: Российская Федерация", leak: "Российская Федерация"},
+		{name: "passport authority", original: "паспорт выдан ОУФМС России по г. Москве", leak: "ОУФМС России по г. Москве"},
+		{name: "passport issue date", original: "дата выдачи: 15.04.2015", leak: "15.04.2015"},
+		{name: "address", original: "адрес клиента: г. Москва, ул. Ленина, д. 5, кв. 10", leak: "г. Москва, ул. Ленина, д. 5, кв. 10"},
+		{name: "card holder", original: "держатель карты IVAN IVANOV", leak: "IVAN IVANOV"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -333,6 +349,73 @@ func TestProcessCreatorCancelledNoPartialState(t *testing.T) {
 	}
 	if res.Text == "a@b.ru" {
 		t.Fatalf("masked text equals original: %q", res.Text)
+	}
+}
+
+// TestProcessRoleDistinction verifies that the same name or address is masked
+// only when its role is client data, not when it is a reference mention or a
+// bank-branch requisite.
+func TestProcessRoleDistinction(t *testing.T) {
+	svc := newAllService()
+	ctx := context.Background()
+	tests := []struct {
+		name   string
+		in     string
+		leak   string
+		masked bool
+	}{
+		{name: "poet reference not masked", in: "поэт Александр Пушкин написал роман", leak: "Александр Пушкин", masked: false},
+		{name: "client same name masked", in: "клиент Александр Пушкин открыл счёт", leak: "Александр Пушкин", masked: true},
+		{name: "branch address not masked", in: "адрес отделения: г. Москва, ул. Тверская, д. 1", leak: "г. Москва, ул. Тверская, д. 1", masked: false},
+		{name: "client address masked", in: "адрес клиента: г. Москва, ул. Ленина, д. 5", leak: "г. Москва, ул. Ленина, д. 5", masked: true},
+		{name: "branch and client address in one sentence", in: "адрес отделения: г. Москва, ул. Тверская, д. 1; адрес клиента: г. Москва, ул. Ленина, д. 5", leak: "г. Москва, ул. Ленина, д. 5", masked: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := svc.Process(ctx, "id-role-"+tt.name, tt.in)
+			if err != nil {
+				t.Fatalf("process: %v", err)
+			}
+			got := contains(res.Text, tt.leak)
+			if got == tt.masked {
+				t.Fatalf("masked=%v, want masked=%v; result %q", got, tt.masked, res.Text)
+			}
+		})
+	}
+}
+
+// TestProcessCombinedCategories verifies that a text with several categories is
+// masked at the expected boundaries and restored exactly.
+func TestProcessCombinedCategories(t *testing.T) {
+	svc := newAllService()
+	ctx := context.Background()
+	original := "ФИО: Иванов Иван Иванович, дата рождения: 12.03.1990, " +
+		"место рождения: г. Москва, гражданство: Российская Федерация, " +
+		"паспорт 4506 123456 выдан ОУФМС России по г. Москве, дата выдачи: 15.04.2015, " +
+		"адрес клиента: г. Москва, ул. Ленина, д. 5, кв. 10, " +
+		"тел +7 (912) 345-67-89, карта 4111 1111 1111 1111, держатель карты IVAN IVANOV"
+	res, err := svc.Process(ctx, "id-combined", original)
+	if err != nil {
+		t.Fatalf("mask: %v", err)
+	}
+	masked := res.Text
+	for _, leak := range []string{
+		"Иванов Иван Иванович", "12.03.1990", "г. Москва", "Российская Федерация",
+		"4506 123456", "ОУФМС России по г. Москве", "15.04.2015",
+		"г. Москва, ул. Ленина, д. 5, кв. 10", "+7 (912) 345-67-89",
+		"4111 1111 1111 1111", "IVAN IVANOV",
+	} {
+		if contains(masked, leak) {
+			t.Fatalf("masked %q still contains %q", masked, leak)
+		}
+	}
+	// Restore returns the exact original.
+	res2, err := svc.Process(ctx, "id-combined", masked)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if res2.Text != original {
+		t.Fatalf("restore = %q, want %q", res2.Text, original)
 	}
 }
 

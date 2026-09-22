@@ -15,15 +15,23 @@ type Type string
 
 // Supported data types.
 const (
-	Email          Type = "email"
-	Phone          Type = "phone"
-	INN            Type = "inn"
-	Card           Type = "card"
-	Passport       Type = "passport"
-	DepartmentCode Type = "department_code"
-	DriverLicense  Type = "driver_license"
-	PIN            Type = "pin"
-	CVV            Type = "cvv"
+	Email             Type = "email"
+	Phone             Type = "phone"
+	INN               Type = "inn"
+	Card              Type = "card"
+	Passport          Type = "passport"
+	DepartmentCode    Type = "department_code"
+	DriverLicense     Type = "driver_license"
+	PIN               Type = "pin"
+	CVV               Type = "cvv"
+	FullName          Type = "full_name"
+	BirthDate         Type = "birth_date"
+	BirthPlace        Type = "birth_place"
+	Citizenship       Type = "citizenship"
+	PassportAuthority Type = "passport_authority"
+	PassportIssueDate Type = "passport_issue_date"
+	Address           Type = "address"
+	CardHolderName    Type = "card_holder_name"
 )
 
 // Fragment is a single sensitive occurrence in a text.
@@ -53,15 +61,23 @@ var ErrProtection = errors.New("invalid fragment range")
 // fragments partially overlap, the higher-priority type wins; the overlap is
 // never resolved by extending a range to cover the whole string.
 var typePriority = map[Type]int{
-	Email:          100,
-	Card:           90,
-	Passport:       80,
-	DriverLicense:  80,
-	Phone:          70,
-	INN:            60,
-	DepartmentCode: 50,
-	PIN:            40,
-	CVV:            30,
+	Email:             100,
+	Card:              90,
+	CardHolderName:    85,
+	Passport:          80,
+	DriverLicense:     80,
+	Phone:             70,
+	INN:               60,
+	BirthDate:         55,
+	BirthPlace:        55,
+	Citizenship:       55,
+	PassportAuthority: 55,
+	PassportIssueDate: 55,
+	Address:           55,
+	DepartmentCode:    50,
+	FullName:          45,
+	PIN:               40,
+	CVV:               30,
 }
 
 // Resolve validates all fragments and resolves overlaps deterministically.

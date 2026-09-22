@@ -38,6 +38,14 @@ func main() {
 		recognizer.DriverLicenseRecognizer{},
 		recognizer.PINRecognizer{},
 		recognizer.CVVRecognizer{},
+		recognizer.FullNameRecognizer{},
+		recognizer.BirthDateRecognizer{},
+		recognizer.BirthPlaceRecognizer{},
+		recognizer.CitizenshipRecognizer{},
+		recognizer.PassportAuthorityRecognizer{},
+		recognizer.PassportIssueDateRecognizer{},
+		recognizer.AddressRecognizer{},
+		recognizer.CardHolderNameRecognizer{},
 	}
 	m := masker.New(cfg.MarkerPrefix)
 	st := store.NewMemory(store.Limits{
