@@ -1,0 +1,14 @@
+{
+  "consumers": [
+    {
+      "name": "demo",
+      "enabled": true,
+      "types": ["full_name", "phone", "email", "passport"],
+      "masking_enabled": true,
+      "can_restore": true,
+      "mask_format": "marker",
+      "secret_env": "PII_CONSUMER_DEMO_SECRET"
+    }
+  ],
+  "regexp_rules": []
+}

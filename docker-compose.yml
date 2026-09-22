@@ -1,0 +1,53 @@
+# Local run configuration for pii-service.
+#
+# Ports, resource limits and application settings are explicit here. The
+# consumers file is mounted read-only; secrets are provided through the
+# environment (see .env / .env.example) and never baked into the image.
+#
+# The root filesystem is mounted read-only because the service performs no file
+# writes. A writable /tmp is provided for the Go runtime.
+#
+# Readiness is checked from the host (the runtime image has no shell or curl);
+# see the Makefile targets `health` and `demo`.
+services:
+  pii-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: alfa-pii/pii-service:local
+    container_name: pii-service
+    ports:
+      - "8080:8080"
+    environment:
+      PII_LISTEN_ADDR: ":8080"
+      PII_READ_TIMEOUT: "10s"
+      PII_WRITE_TIMEOUT: "10s"
+      PII_IDLE_TIMEOUT: "60s"
+      PII_SHUTDOWN_TIMEOUT: "10s"
+      PII_MAX_BODY_BYTES: "1048576"
+      PII_MAX_ACTIVE_REQUESTS: "200"
+      PII_STORE_MAX_ENTRIES: "100000"
+      PII_STORE_MAX_BYTES: "67108864"
+      PII_STORE_MAX_RECORD_BYTES: "1048576"
+      PII_STORE_TTL: "24h"
+      PII_STORE_CREATE_WAIT: "5s"
+      PII_STORE_CLEANUP_INTERVAL: "1m"
+      PII_MARKER_PREFIX: "PII"
+      PII_CONSUMERS_FILE: "/etc/pii/consumers.local.json"
+      PII_CONSUMER_DEMO_SECRET: "${PII_CONSUMER_DEMO_SECRET:-demo-secret}"
+    volumes:
+      - ./config/consumers.local.json:/etc/pii/consumers.local.json:ro
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+        reservations:
+          cpus: "0.5"
+          memory: 128M
+    restart: "no"
