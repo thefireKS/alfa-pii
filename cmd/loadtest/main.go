@@ -1,0 +1,503 @@
+// Command loadtest drives a reproducible load profile against the /process
+// endpoint of pii-service. It pre-generates synthetic texts from different
+// categories with a fixed seed, so the cost of generating inputs is never
+// attributed to the service. It supports three operation distributions, a
+// scheduled send mode, a large-text scenario and a compatibility check, and
+// writes a report plus raw results to .artifacts/.
+//
+// Usage:
+//
+//	go run ./cmd/loadtest -base http://127.0.0.1:8080 -mode sequential -duration 5m
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"alfa-hackathon.local/pii/internal/loadgen"
+)
+
+func main() {
+	var (
+		base       = flag.String("base", "http://127.0.0.1:8080", "service base URL")
+		mode       = flag.String("mode", "sequential", "scenario mode: sequential|mask_dominant|restore_dominant")
+		duration   = flag.Duration("duration", 5*time.Minute, "run duration")
+		target     = flag.Float64("target", 330, "target RPS")
+		peak       = flag.Float64("peak", 1000, "peak RPS during ramp")
+		ramp       = flag.Duration("ramp", 60*time.Second, "ramp-up duration")
+		burstEvery = flag.Duration("burst-every", 0, "interval between bursts (0 disables bursts)")
+		burstDur   = flag.Duration("burst-duration", 0, "duration of each burst")
+		workers    = flag.Int("workers", 200, "concurrent connections")
+		seed       = flag.Int64("seed", loadgen.DefaultSeed, "generator seed")
+		outDir     = flag.String("out", ".artifacts", "output directory")
+		container  = flag.String("container", "pii-service", "container name for docker stats")
+		prep       = flag.Int("prep", 0, "preparation count for restore_dominant")
+		restoreFrac = flag.Float64("restore-fraction", 0.5, "fraction of restore steps")
+		restoreBudget = flag.Int("restore-budget", 1, "max restores per pair in restore_dominant")
+		totalPairs = flag.Int("pairs", 100000, "total distinct payload_ids")
+		small      = flag.Int("small", 120, "small payload size in chars")
+		medium     = flag.Int("medium", 400, "medium payload size in chars")
+		large      = flag.Int("large", 2000, "large payload size in chars")
+		largeText  = flag.Bool("large-text", false, "run the large-text scenario")
+		scheduled  = flag.Bool("scheduled", false, "run the scheduled send mode")
+		compat     = flag.Bool("compat", false, "run the compatibility check")
+		queue      = flag.Int("queue", 64, "pacer/scheduler queue size")
+	)
+	flag.Parse()
+
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "mkdir %s: %v\n", *outDir, err)
+		os.Exit(1)
+	}
+
+	client := loadgen.NewClient(*base, *workers, 10*time.Second)
+	poller := loadgen.NewMetricsPoller(*base, *container)
+
+	ctx, cancel := context.WithTimeout(context.Background(), *duration)
+	defer cancel()
+
+	switch {
+	case *largeText:
+		runLargeText(ctx, client, *base, *outDir, *seed)
+		return
+	case *scheduled:
+		runScheduled(ctx, client, poller, *base, *outDir, *seed, *target, *workers, *queue, *totalPairs, *restoreFrac, *small, *medium, *large)
+		return
+	case *compat:
+		runCompat(ctx, client, *base, *outDir, *seed, *small, *medium, *large)
+		return
+	}
+
+	runMain(ctx, client, poller, loadgen.Mode(*mode), *base, *outDir, *seed,
+		*target, *peak, *ramp, *burstEvery, *burstDur, *workers, *queue, *prep, *restoreFrac, *restoreBudget,
+		*totalPairs, *small, *medium, *large)
+}
+
+// runMain runs the main load profile.
+func runMain(ctx context.Context, client *loadgen.Client, poller *loadgen.MetricsPoller,
+	mode loadgen.Mode, base, outDir string, seed int64, target, peak float64, ramp, burstEvery, burstDur time.Duration,
+	workers, queue, prep int, restoreFrac float64, restoreBudget, totalPairs, small, medium, large int) {
+
+	gen := loadgen.NewTextGenerator(seed, loadgen.DefaultSizeProfile(), small, medium, large)
+	cfg := loadgen.ScenarioConfig{
+		Mode:            mode,
+		TotalPairs:      totalPairs,
+		RestoreFraction: restoreFrac,
+		RestoreBudget:   restoreBudget,
+		Seed:            seed,
+	}
+
+	scenario := loadgen.NewScenario(cfg, gen)
+	var prepNote string
+	if mode == loadgen.ModeRestoreDominant {
+		prepNote = runPreparation(ctx, client, scenario, gen, prep, restoreBudget)
+	}
+	pacer := loadgen.NewPacer(loadgen.PacerConfig{
+		Target:        target,
+		Peak:          peak,
+		BurstEvery:    burstEvery,
+		BurstDuration: burstDur,
+		Ramp:          ramp,
+		Queue:         queue,
+	})
+	defer pacer.Stop()
+
+	runner := loadgen.NewRunner(client, scenario, pacer, loadgen.RunnerConfig{
+		Workers:               workers,
+		Retry:                 loadgen.DefaultRetryPolicy(),
+		MaxConsecutiveInvalid: 5,
+	})
+
+	// Poll metrics periodically during the run.
+	pollCtx, pollCancel := context.WithCancel(context.Background())
+	defer pollCancel()
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pollCtx.Done():
+				return
+			case <-ticker.C:
+				poller.Poll(pollCtx)
+			}
+		}
+	}()
+
+	start := time.Now()
+	stopReason := runner.Run(ctx)
+	duration := time.Since(start)
+	poller.Poll(context.Background())
+
+	granted, consumed, skipped := pacer.Counts()
+	sent, maskSuccess, restoreSuccess, restoreMismatch, maskNoChange := runner.Counts()
+	sm, peakCPU, peakRSS := poller.Snapshot()
+
+	rep := &loadgen.Report{
+		Title:           "Main load profile",
+		Mode:            mode,
+		Seed:            seed,
+		Duration:        duration,
+		TargetRPS:       target,
+		Granted:         granted,
+		Consumed:        consumed,
+		Skipped:         skipped,
+		Sent:            sent,
+		MaskSuccess:     maskSuccess,
+		RestoreSuccess:  restoreSuccess,
+		RestoreMismatch: restoreMismatch,
+		MaskNoChange:    maskNoChange,
+		StopReason:      stopReason,
+		Stats:           runner.Stats(),
+		Pending:         scenario.Pending(),
+		StoreRecords:    sm.StoreRecords,
+		StoreBytes:      sm.StoreBytes,
+		CPUPercent:      peakCPU,
+		RSSBytes:        peakRSS,
+		ContainerLimits: loadgen.ContainerLimits(containerName()),
+		SizeProfile:     fmt.Sprintf("small=%d medium=%d large=%d", small, medium, large),
+		OpFraction:      fmt.Sprintf("restore_fraction=%.2f", restoreFrac),
+		Preparation:     prepNote,
+		Notes: []string{
+			"Token estimate is runes/4 (no exact tokenizer); sizes are in bytes and chars.",
+			"Generator memory is separate from service memory; inputs are pre-generated.",
+		},
+	}
+
+	writeReport(outDir, "main-"+string(mode)+".txt", rep)
+	writeJSON(outDir, "main-"+string(mode)+".json", rep)
+	fmt.Print(rep.String())
+}
+
+// runPreparation creates the pre-created set for restore_dominant. It returns a
+// description of the preparation cost and size. Each successfully created
+// correspondence is registered in the scenario so it can be restored later.
+func runPreparation(ctx context.Context, client *loadgen.Client, scenario loadgen.Scenario, gen *loadgen.TextGenerator, count, budget int) string {
+	if count <= 0 {
+		return "no preparation (restore_dominant with no pre-created set)"
+	}
+	prepared, ok := scenario.(loadgen.PreparedScenario)
+	if !ok {
+		return "preparation skipped: scenario does not support pre-created set"
+	}
+	start := time.Now()
+	success := 0
+	var bytes int64
+	for i := 0; i < count; i++ {
+		text, _ := gen.Next()
+		id := "prep-" + itoa(i)
+		resp, _ := client.SendWithRetry(ctx, id, text, loadgen.DefaultRetryPolicy())
+		if resp.IsValidSuccess() && resp.Result != text {
+			prepared.AddPrepared(text, resp.Result, budget)
+			success++
+			bytes += int64(len(text))
+		}
+	}
+	dur := time.Since(start)
+	return fmt.Sprintf("created %d/%d correspondences in %s, %d bytes, budget=%d", success, count, dur.Round(time.Millisecond), bytes, budget)
+}
+
+// runLargeText runs the large-text scenario up to the 100k-token limit.
+func runLargeText(ctx context.Context, client *loadgen.Client, base, outDir string, seed int64) {
+	// Token estimate is runes/4, so 100k tokens ~= 400k runes. Test a range of
+	// sizes in tokens: 10k, 50k, 100k.
+	tokenTargets := []int{10000, 50000, 100000}
+	gen := loadgen.NewTextGenerator(seed, loadgen.DefaultSizeProfile(), 120, 400, 2000)
+	stats := loadgen.NewStats()
+	var b strings.Builder
+	w := func(format string, args ...any) {
+		fmt.Fprintf(&b, format+"\n", args...)
+	}
+	w("=== Large-text scenario ===")
+	w("Token estimate: runes/4 (no exact tokenizer). Sizes reported in bytes and chars.")
+	w("Seed: %d", seed)
+	w("Note: the store per-record limit (PII_STORE_MAX_RECORD_BYTES, default 1 MiB) bounds the")
+	w("mask->restore cycle. A 100k-token text (~748 KB) plus its mask exceeds 1 MiB, so the")
+	w("correspondence is rejected with 429. The mask operation itself succeeds; storage does not.")
+	for _, tokens := range tokenTargets {
+		runes := tokens * 4
+		text := buildLargeText(gen, runes)
+		id := fmt.Sprintf("large-%d", tokens)
+		start := time.Now()
+		resp, _ := client.SendWithRetry(ctx, id, text, loadgen.DefaultRetryPolicy())
+		latency := time.Since(start)
+		stats.RecordChars(loadgen.OutcomeOK, resp.Status, latency, len(text), runeCount(text))
+		w("tokens=%d runes=%d bytes=%d chars=%d status=%d latency=%s result_len=%d",
+			tokens, runes, len(text), runeCount(text), resp.Status, latency.Round(time.Microsecond), len(resp.Result))
+		if resp.IsValidSuccess() {
+			// Restore the mask to verify exact restoration.
+			start = time.Now()
+			restoreResp, _ := client.SendWithRetry(ctx, id, resp.Result, loadgen.DefaultRetryPolicy())
+			restoreLatency := time.Since(start)
+			ok := restoreResp.IsValidSuccess() && restoreResp.Result == text
+			w("  restore status=%d latency=%s exact=%v", restoreResp.Status, restoreLatency.Round(time.Microsecond), ok)
+		}
+	}
+	writeFile(outDir, "large-text.txt", b.String())
+	fmt.Print(b.String())
+}
+
+// buildLargeText builds a text of approximately the given rune count by
+// repeating a synthetic fragment with filler. It is deterministic for a given
+// generator seed.
+func buildLargeText(gen *loadgen.TextGenerator, runes int) string {
+	base, _ := gen.Next()
+	for runeCount(base) < runes {
+		base += " " + gen.FillerWord()
+	}
+	return base
+}
+
+// runScheduled runs the scheduled send mode.
+func runScheduled(ctx context.Context, client *loadgen.Client, poller *loadgen.MetricsPoller,
+	base, outDir string, seed int64, target float64, workers, queue, totalPairs int, restoreFrac float64, small, medium, large int) {
+
+	gen := loadgen.NewTextGenerator(seed, loadgen.DefaultSizeProfile(), small, medium, large)
+	scenario := loadgen.NewScenario(loadgen.ScenarioConfig{
+		Mode:            loadgen.ModeMaskDominant,
+		TotalPairs:      totalPairs,
+		RestoreFraction: restoreFrac,
+		Seed:            seed,
+	}, gen)
+	sched := loadgen.NewScheduler(client, scenario, loadgen.SchedulerConfig{
+		Target:  target,
+		Workers: workers,
+		Queue:   queue,
+		Retry:   loadgen.DefaultRetryPolicy(),
+	})
+
+	pollCtx, pollCancel := context.WithCancel(context.Background())
+	defer pollCancel()
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pollCtx.Done():
+				return
+			case <-ticker.C:
+				poller.Poll(pollCtx)
+			}
+		}
+	}()
+
+	start := time.Now()
+	stopReason := sched.Run(ctx)
+	duration := time.Since(start)
+	poller.Poll(context.Background())
+
+	scheduled, sent, late, skipped, maskSuccess, restoreSuccess, restoreMismatch, maskNoChange := sched.Counts()
+	sm, peakCPU, peakRSS := poller.Snapshot()
+
+	rep := &loadgen.Report{
+		Title:           "Scheduled send mode",
+		Mode:            loadgen.ModeMaskDominant,
+		Seed:            seed,
+		Duration:        duration,
+		TargetRPS:       target,
+		Granted:         scheduled,
+		Consumed:        sent,
+		Skipped:         skipped,
+		Late:            late,
+		Sent:            sent,
+		MaskSuccess:     maskSuccess,
+		RestoreSuccess:  restoreSuccess,
+		RestoreMismatch: restoreMismatch,
+		MaskNoChange:    maskNoChange,
+		StopReason:      stopReason,
+		Stats:           sched.Stats(),
+		Pending:         scenario.Pending(),
+		StoreRecords:    sm.StoreRecords,
+		StoreBytes:      sm.StoreBytes,
+		CPUPercent:      peakCPU,
+		RSSBytes:        peakRSS,
+		ContainerLimits: loadgen.ContainerLimits(containerName()),
+		SizeProfile:     fmt.Sprintf("small=%d medium=%d large=%d", small, medium, large),
+		OpFraction:      fmt.Sprintf("restore_fraction=%.2f", restoreFrac),
+		Notes: []string{
+			"Scheduled mode: fixed rate, bounded queue, late sends and skips visible.",
+			"Late count is not tracked per-slot; skips are queue-full drops.",
+		},
+	}
+	writeReport(outDir, "scheduled.txt", rep)
+	writeJSON(outDir, "scheduled.json", rep)
+	fmt.Print(rep.String())
+}
+
+// runCompat runs the compatibility check: stop after five consecutive invalid
+// responses; 429 does not increment or reset the counter; success resets it.
+func runCompat(ctx context.Context, client *loadgen.Client, base, outDir string, seed int64, small, medium, large int) {
+	gen := loadgen.NewTextGenerator(seed, loadgen.DefaultSizeProfile(), small, medium, large)
+	scenario := loadgen.NewScenario(loadgen.ScenarioConfig{
+		Mode:       loadgen.ModeSequential,
+		TotalPairs: 1000,
+		Seed:       seed,
+	}, gen)
+	pacer := loadgen.NewPacer(loadgen.PacerConfig{Target: 50, Ramp: 0, Queue: 8})
+	defer pacer.Stop()
+	runner := loadgen.NewRunner(client, scenario, pacer, loadgen.RunnerConfig{
+		Workers:               20,
+		Retry:                 loadgen.DefaultRetryPolicy(),
+		MaxConsecutiveInvalid: 5,
+	})
+	start := time.Now()
+	stopReason := runner.Run(ctx)
+	duration := time.Since(start)
+	sent, maskSuccess, restoreSuccess, _, _ := runner.Counts()
+	rep := &loadgen.Report{
+		Title:          "Compatibility check",
+		Mode:           loadgen.ModeSequential,
+		Seed:           seed,
+		Duration:       duration,
+		TargetRPS:      50,
+		Sent:           sent,
+		MaskSuccess:    maskSuccess,
+		RestoreSuccess: restoreSuccess,
+		StopReason:     stopReason,
+		Stats:          runner.Stats(),
+		Notes: []string{
+			"Stops after five consecutive invalid responses; 429 neither increments nor resets; success resets.",
+		},
+	}
+	writeReport(outDir, "compat.txt", rep)
+	writeJSON(outDir, "compat.json", rep)
+	fmt.Print(rep.String())
+}
+
+func containerName() string {
+	if v := os.Getenv("PII_LOADTEST_CONTAINER"); v != "" {
+		return v
+	}
+	return "pii-service"
+}
+
+func writeReport(outDir, name string, rep *loadgen.Report) {
+	writeFile(outDir, name, rep.String())
+}
+
+func writeJSON(outDir, name string, rep *loadgen.Report) {
+	type jsonStats struct {
+		Count    int64                  `json:"count"`
+		Outcomes map[loadgen.Outcome]int64 `json:"outcomes"`
+		Statuses map[int]int64          `json:"statuses"`
+		Bytes    int64                  `json:"bytes"`
+		Chars    int64                  `json:"chars"`
+	}
+	type jsonLatency struct {
+		Mean string `json:"mean"`
+		P50  string `json:"p50"`
+		P95  string `json:"p95"`
+		P99  string `json:"p99"`
+	}
+	type jsonReport struct {
+		Title           string     `json:"title"`
+		Mode            loadgen.Mode `json:"mode"`
+		Seed            int64      `json:"seed"`
+		Duration        string     `json:"duration"`
+		TargetRPS       float64    `json:"target_rps"`
+		Granted         int64      `json:"granted"`
+		Consumed        int64      `json:"consumed"`
+		Skipped         int64      `json:"skipped"`
+		Late            int64      `json:"late"`
+		Sent            int64      `json:"sent"`
+		MaskSuccess     int64      `json:"mask_success"`
+		RestoreSuccess  int64      `json:"restore_success"`
+		RestoreMismatch int64      `json:"restore_mismatch"`
+		MaskNoChange    int64      `json:"mask_no_change"`
+		StopReason      string     `json:"stop_reason"`
+		Pending         int        `json:"pending"`
+		StoreRecords    int64      `json:"store_records"`
+		StoreBytes      int64      `json:"store_bytes"`
+		CPUPercent      float64    `json:"cpu_percent"`
+		RSSBytes        int64      `json:"rss_bytes"`
+		ContainerLimits string     `json:"container_limits"`
+		SizeProfile     string     `json:"size_profile"`
+		OpFraction      string     `json:"op_fraction"`
+		Preparation     string     `json:"preparation"`
+		Notes           []string   `json:"notes"`
+		Stats           *jsonStats `json:"stats"`
+		Latency         *jsonLatency `json:"latency"`
+	}
+	jr := &jsonReport{
+		Title:           rep.Title,
+		Mode:            rep.Mode,
+		Seed:            rep.Seed,
+		Duration:        rep.Duration.String(),
+		TargetRPS:       rep.TargetRPS,
+		Granted:         rep.Granted,
+		Consumed:        rep.Consumed,
+		Skipped:         rep.Skipped,
+		Late:            rep.Late,
+		Sent:            rep.Sent,
+		MaskSuccess:     rep.MaskSuccess,
+		RestoreSuccess:  rep.RestoreSuccess,
+		RestoreMismatch: rep.RestoreMismatch,
+		MaskNoChange:    rep.MaskNoChange,
+		StopReason:      rep.StopReason,
+		Pending:         rep.Pending,
+		StoreRecords:    rep.StoreRecords,
+		StoreBytes:      rep.StoreBytes,
+		CPUPercent:      rep.CPUPercent,
+		RSSBytes:        rep.RSSBytes,
+		ContainerLimits: rep.ContainerLimits,
+		SizeProfile:     rep.SizeProfile,
+		OpFraction:      rep.OpFraction,
+		Preparation:     rep.Preparation,
+		Notes:           rep.Notes,
+	}
+	if rep.Stats != nil {
+		snap := rep.Stats.Snapshot()
+		jr.Stats = &jsonStats{
+			Count:    snap.Count,
+			Outcomes: snap.Outcomes,
+			Statuses: snap.Statuses,
+			Bytes:    snap.Bytes,
+			Chars:    snap.Chars,
+		}
+		mean, pcts := rep.Stats.Percentiles(50, 95, 99)
+		jr.Latency = &jsonLatency{
+			Mean: mean.String(),
+			P50:  pcts[50].String(),
+			P95:  pcts[95].String(),
+			P99:  pcts[99].String(),
+		}
+	}
+	data, err := json.MarshalIndent(jr, "", "  ")
+	if err != nil {
+		return
+	}
+	writeFile(outDir, name, string(data))
+}
+
+func writeFile(outDir, name, content string) {
+	path := filepath.Join(outDir, name)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "write %s: %v\n", path, err)
+	}
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b []byte
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	return string(b)
+}
+
+func runeCount(s string) int {
+	n := 0
+	for range s {
+		n++
+	}
+	return n
+}
