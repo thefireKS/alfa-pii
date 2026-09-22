@@ -30,6 +30,9 @@ go.mod
 go.sum
 Dockerfile
 docker-compose.yml
+compose.server.yml
+init-deploy-env.py
+smoke-deploy.py
 Makefile
 .env.example
 .dockerignore
