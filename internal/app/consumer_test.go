@@ -16,7 +16,7 @@ func newManagedService(consumers []Consumer) (*Service, error) {
 	st := store.NewMemory(store.Limits{MaxEntries: 100, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour, CreateWait: time.Second})
 	reg := recognizer.NewRegistry()
 	processTypes := []recognizer.Type{recognizer.Email, recognizer.Phone}
-	return NewManaged(reg, processTypes, consumers, st, masker.New("PII"))
+	return NewManaged(reg, processTypes, consumers, st, st, masker.New("PII"))
 }
 
 func emailConsumer(name string) Consumer {
@@ -205,7 +205,7 @@ func TestRepeatUsesSavedRecordAfterSettingsChange(t *testing.T) {
 	reg := recognizer.NewRegistry()
 	processTypes := []recognizer.Type{recognizer.Email}
 	alpha := emailConsumer("alpha")
-	svc, err := NewManaged(reg, processTypes, []Consumer{alpha}, st, masker.New("PII"))
+	svc, err := NewManaged(reg, processTypes, []Consumer{alpha}, st, st, masker.New("PII"))
 	if err != nil {
 		t.Fatalf("NewManaged: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestRepeatUsesSavedRecordAfterSettingsChange(t *testing.T) {
 	// must use the saved record, not re-recognize.
 	changed := alpha
 	changed.Types = nil
-	svc2, err := NewManaged(reg, processTypes, []Consumer{changed}, st, masker.New("PII"))
+	svc2, err := NewManaged(reg, processTypes, []Consumer{changed}, st, st, masker.New("PII"))
 	if err != nil {
 		t.Fatalf("NewManaged changed: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestRegexpRuleTypeConnected(t *testing.T) {
 		CanRestore:     true,
 		MaskFormat:     FormatMarker,
 	}
-	svc, err := NewManaged(reg, []recognizer.Type{recognizer.Email}, []Consumer{c}, st, masker.New("PII"))
+	svc, err := NewManaged(reg, []recognizer.Type{recognizer.Email}, []Consumer{c}, st, st, masker.New("PII"))
 	if err != nil {
 		t.Fatalf("NewManaged: %v", err)
 	}
@@ -299,7 +299,46 @@ func TestNewManagedRejectsUnknownConsumerType(t *testing.T) {
 	reg := recognizer.NewRegistry()
 	c := emailConsumer("alpha")
 	c.Types = []recognizer.Type{"not_a_real_type"}
-	if _, err := NewManaged(reg, []recognizer.Type{recognizer.Email}, []Consumer{c}, st, masker.New("PII")); err == nil {
+	if _, err := NewManaged(reg, []recognizer.Type{recognizer.Email}, []Consumer{c}, st, st, masker.New("PII")); err == nil {
 		t.Fatal("expected error for unknown consumer type")
+	}
+}
+
+// TestNewManagedRejectsReservedScopeName verifies that a consumer name that
+// collides with the reserved /process scope is rejected at construction, so an
+// authenticated consumer can never alias the public scope's store key.
+func TestNewManagedRejectsReservedScopeName(t *testing.T) {
+	st := store.NewMemory(store.Limits{MaxEntries: 100, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour, CreateWait: time.Second})
+	reg := recognizer.NewRegistry()
+	for _, name := range []string{ConsumerScope, "alpha:beta"} {
+		c := emailConsumer(name)
+		if _, err := NewManaged(reg, []recognizer.Type{recognizer.Email}, []Consumer{c}, st, st, masker.New("PII")); err == nil {
+			t.Fatalf("expected error for consumer name %q", name)
+		}
+	}
+}
+
+// TestProcessAndConsumerStoresIsolated verifies that exhausting the /process
+// store does not cause capacity errors for managed consumers, because the two
+// scopes use separate stores.
+func TestProcessAndConsumerStoresIsolated(t *testing.T) {
+	processStore := store.NewMemory(store.Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour, CreateWait: time.Second})
+	consumerStore := store.NewMemory(store.Limits{MaxEntries: 100, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour, CreateWait: time.Second})
+	reg := recognizer.NewRegistry()
+	svc, err := NewManaged(reg, []recognizer.Type{recognizer.Email}, []Consumer{emailConsumer("alpha")}, processStore, consumerStore, masker.New("PII"))
+	if err != nil {
+		t.Fatalf("NewManaged: %v", err)
+	}
+	ctx := context.Background()
+	// Fill the /process store to capacity.
+	if _, err := svc.Process(ctx, "p-1", "mail a@b.ru"); err != nil {
+		t.Fatalf("process mask: %v", err)
+	}
+	if _, err := svc.Process(ctx, "p-2", "mail c@d.io"); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("process second = %v, want ErrCapacity", err)
+	}
+	// The consumer store is separate and still accepts new records.
+	if _, err := svc.Mask(ctx, "alpha", "c-1", "mail e@f.gh"); err != nil {
+		t.Fatalf("consumer mask after process capacity: %v", err)
 	}
 }

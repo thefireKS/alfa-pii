@@ -76,6 +76,8 @@ func TestLoadConsumersRejectsInvalid(t *testing.T) {
 		{name: "no types", content: `{"consumers":[{"name":"a","enabled":true,"types":[],"masking_enabled":true,"can_restore":true,"mask_format":"marker","secret_env":"PII_A"}]}`, env: map[string]string{"PII_A": "v"}},
 		{name: "bad format", content: `{"consumers":[{"name":"a","enabled":true,"types":["email"],"masking_enabled":true,"can_restore":true,"mask_format":"bogus","secret_env":"PII_A"}]}`, env: map[string]string{"PII_A": "v"}},
 		{name: "duplicate name", content: `{"consumers":[{"name":"a","enabled":true,"types":["email"],"masking_enabled":true,"can_restore":true,"mask_format":"marker","secret_env":"PII_A"},{"name":"a","enabled":true,"types":["phone"],"masking_enabled":true,"can_restore":true,"mask_format":"marker","secret_env":"PII_A"}]}`, env: map[string]string{"PII_A": "v"}},
+		{name: "reserved scope name", content: `{"consumers":[{"name":"process","enabled":true,"types":["email"],"masking_enabled":true,"can_restore":true,"mask_format":"marker","secret_env":"PII_A"}]}`, env: map[string]string{"PII_A": "v"}},
+		{name: "name with separator", content: `{"consumers":[{"name":"a:b","enabled":true,"types":["email"],"masking_enabled":true,"can_restore":true,"mask_format":"marker","secret_env":"PII_A"}]}`, env: map[string]string{"PII_A": "v"}},
 		{name: "empty rule type", content: `{"regexp_rules":[{"type":"","priority":1,"pattern":"x","max_matches":1}]}`},
 		{name: "empty rule pattern", content: `{"regexp_rules":[{"type":"t","priority":1,"pattern":"","max_matches":1}]}`},
 		{name: "zero rule max matches", content: `{"regexp_rules":[{"type":"t","priority":1,"pattern":"x","max_matches":0}]}`},

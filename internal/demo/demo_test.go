@@ -22,7 +22,7 @@ func testServer(t *testing.T, consumers []app.Consumer, secrets map[string]strin
 	reg := recognizer.NewRegistry()
 	processTypes := []recognizer.Type{recognizer.Email, recognizer.Phone, recognizer.FullName, recognizer.Passport}
 	st := store.NewMemory(store.Limits{MaxEntries: 100, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour, CreateWait: time.Second})
-	svc, err := app.NewManaged(reg, processTypes, consumers, st, masker.New("PII"))
+	svc, err := app.NewManaged(reg, processTypes, consumers, st, st, masker.New("PII"))
 	if err != nil {
 		t.Fatalf("NewManaged: %v", err)
 	}

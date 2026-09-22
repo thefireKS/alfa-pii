@@ -50,6 +50,29 @@ func TestCreateExistingReturnsExisting(t *testing.T) {
 	}
 }
 
+// TestCreateAtCapacitySkipsBuild verifies that when the store is already at
+// capacity, Create returns ErrCapacity without invoking build, so an expensive
+// recognition is not paid for a request that cannot be stored.
+func TestCreateAtCapacitySkipsBuild(t *testing.T) {
+	limits := testLimits()
+	limits.MaxEntries = 1
+	s := NewMemory(limits)
+	if _, _, err := s.Create(context.Background(), "k1", build(rec("orig", "mask"))); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	built := false
+	_, _, err := s.Create(context.Background(), "k2", func(context.Context) (Record, error) {
+		built = true
+		return rec("o", "m"), nil
+	})
+	if !errors.Is(err, ErrCapacity) {
+		t.Fatalf("err = %v, want ErrCapacity", err)
+	}
+	if built {
+		t.Fatal("build was invoked for a request rejected at capacity")
+	}
+}
+
 func TestConcurrentCreateSameKey(t *testing.T) {
 	s := NewMemory(testLimits())
 	const n = 50

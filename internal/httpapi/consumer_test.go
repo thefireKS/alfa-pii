@@ -18,7 +18,7 @@ func newConsumerHandler(consumers []app.Consumer, secrets map[string]string) (*H
 	st := store.NewMemory(store.Limits{MaxEntries: 100, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour, CreateWait: time.Second})
 	reg := recognizer.NewRegistry()
 	processTypes := []recognizer.Type{recognizer.Email}
-	svc, err := app.NewManaged(reg, processTypes, consumers, st, masker.New("PII"))
+	svc, err := app.NewManaged(reg, processTypes, consumers, st, st, masker.New("PII"))
 	if err != nil {
 		return nil, err
 	}

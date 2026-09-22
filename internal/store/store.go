@@ -191,6 +191,18 @@ func (s *Memory) Create(ctx context.Context, key string, build func(context.Cont
 		s.inflight[key] = inf
 		s.mu.Unlock()
 
+		// Reject before running build when the store is already at capacity, so
+		// an expensive recognition is not paid for a request that cannot be
+		// stored. The per-record size is still checked after build.
+		s.mu.Lock()
+		if len(s.entries) >= s.limits.MaxEntries || s.bytes >= s.limits.MaxBytes {
+			s.mu.Unlock()
+			s.finishInflight(key, inf, Record{}, ErrCapacity)
+			s.reportFailure(StoreFailCapacity)
+			return Record{}, false, ErrCapacity
+		}
+		s.mu.Unlock()
+
 		rec, err := build(ctx)
 		if err != nil {
 			s.finishInflight(key, inf, Record{}, err)

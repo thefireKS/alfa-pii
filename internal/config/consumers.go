@@ -156,10 +156,21 @@ func resolveSecret(envName, filePath string) (string, error) {
 	return "", errors.New("no secret configured; set secret_env or secret_file")
 }
 
+// reservedScopeName is the fixed key scope used by the unauthenticated
+// /process endpoint. A consumer must not reuse it, otherwise its store key
+// would alias the public scope.
+const reservedScopeName = "process"
+
 // validateConsumer checks the structural invariants of a consumer policy.
 func validateConsumer(c Consumer) error {
 	if c.Name == "" {
 		return errors.New("consumer name must not be empty")
+	}
+	if c.Name == reservedScopeName {
+		return fmt.Errorf("consumer name %q collides with reserved scope %q", c.Name, reservedScopeName)
+	}
+	if strings.Contains(c.Name, ":") {
+		return fmt.Errorf("consumer name %q must not contain %q", c.Name, ":")
 	}
 	if len(c.Types) == 0 {
 		return fmt.Errorf("consumer %q: at least one type is required", c.Name)

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"alfa-hackathon.local/pii/internal/masker"
 	"alfa-hackathon.local/pii/internal/recognizer"
@@ -110,28 +111,33 @@ type Registry interface {
 
 // Service implements the process, mask and restore operations.
 type Service struct {
-	recognizers []Recognizer
-	store       Store
-	masker      *masker.Masker
-	consumers   map[string]Consumer
-	registry    Registry
+	recognizers   []Recognizer
+	processStore  Store
+	consumerStore Store
+	masker        *masker.Masker
+	consumers     map[string]Consumer
+	registry      Registry
 }
 
 // New returns a Service wired with the given dependencies for the fixed
-// /process scope. No managed consumers are configured.
+// /process scope. No managed consumers are configured. The same store backs
+// both the process scope and (unused) consumer operations.
 func New(recognizers []Recognizer, st Store, m *masker.Masker) *Service {
 	return &Service{
-		recognizers: recognizers,
-		store:       st,
-		masker:      m,
-		consumers:   make(map[string]Consumer),
+		recognizers:   recognizers,
+		processStore:  st,
+		consumerStore: st,
+		masker:        m,
+		consumers:     make(map[string]Consumer),
 	}
 }
 
 // NewManaged returns a Service for the fixed /process scope plus the given
 // managed consumers. The process scope uses the recognizers built from
-// processTypes via the registry. Consumers are keyed by name.
-func NewManaged(registry Registry, processTypes []recognizer.Type, consumers []Consumer, st Store, m *masker.Masker) (*Service, error) {
+// processTypes via the registry and its own store, so the unauthenticated
+// /process endpoint cannot exhaust the capacity of the managed consumers'
+// store. Consumers are keyed by name.
+func NewManaged(registry Registry, processTypes []recognizer.Type, consumers []Consumer, processStore, consumerStore Store, m *masker.Masker) (*Service, error) {
 	recs, _, err := registry.Recognizers(processTypes)
 	if err != nil {
 		return nil, fmt.Errorf("build process recognizers: %w", err)
@@ -142,6 +148,15 @@ func NewManaged(registry Registry, processTypes []recognizer.Type, consumers []C
 	}
 	byName := make(map[string]Consumer, len(consumers))
 	for _, c := range consumers {
+		// A consumer name must not collide with the reserved /process scope or
+		// contain the key separator, otherwise its store key would alias the
+		// public scope or another consumer's namespace.
+		if c.Name == ConsumerScope {
+			return nil, fmt.Errorf("consumer name %q collides with reserved scope %q", c.Name, ConsumerScope)
+		}
+		if strings.Contains(c.Name, ":") {
+			return nil, fmt.Errorf("consumer name %q must not contain %q", c.Name, ":")
+		}
 		// Validate every configured type before the service is built so an
 		// unknown type never activates partially.
 		if _, _, err := registry.Recognizers(c.Types); err != nil {
@@ -150,11 +165,12 @@ func NewManaged(registry Registry, processTypes []recognizer.Type, consumers []C
 		byName[c.Name] = c
 	}
 	return &Service{
-		recognizers: appRecs,
-		store:       st,
-		masker:      m,
-		consumers:   byName,
-		registry:    registry,
+		recognizers:   appRecs,
+		processStore:  processStore,
+		consumerStore: consumerStore,
+		masker:        m,
+		consumers:     byName,
+		registry:      registry,
 	}, nil
 }
 
@@ -189,12 +205,12 @@ func (s *Service) Process(ctx context.Context, payloadID, payload string) (Resul
 	log := loggerFrom(ctx)
 	key := ConsumerScope + ":" + payloadID
 
-	rec, ok := s.store.Get(key)
+	rec, ok := s.processStore.Get(key)
 	if !ok {
 		log.Info("stage", "stage", "operation", "direction", "mask_new")
 		var created bool
 		var err error
-		rec, created, err = s.create(ctx, key, func(ctx context.Context) (store.Record, error) {
+		rec, created, err = s.create(ctx, s.processStore, key, func(ctx context.Context) (store.Record, error) {
 			if err := ctx.Err(); err != nil {
 				return store.Record{}, err
 			}
@@ -242,12 +258,12 @@ func (s *Service) Mask(ctx context.Context, consumerName, payloadID, payload str
 	}
 	key := consumerName + ":" + payloadID
 
-	rec, ok := s.store.Get(key)
+	rec, ok := s.consumerStore.Get(key)
 	if !ok {
 		log.Info("stage", "stage", "operation", "direction", "mask_new")
 		var created bool
 		var err error
-		rec, created, err = s.create(ctx, key, func(ctx context.Context) (store.Record, error) {
+		rec, created, err = s.create(ctx, s.consumerStore, key, func(ctx context.Context) (store.Record, error) {
 			if err := ctx.Err(); err != nil {
 				return store.Record{}, err
 			}
@@ -298,7 +314,7 @@ func (s *Service) Restore(ctx context.Context, consumerName, payloadID, masked s
 	}
 	key := consumerName + ":" + payloadID
 
-	rec, ok := s.store.Get(key)
+	rec, ok := s.consumerStore.Get(key)
 	if !ok {
 		return Result{}, ErrNotFound
 	}
@@ -395,11 +411,11 @@ func (s *Service) maskFor(c Consumer, text string) (string, []masker.Replacement
 	return masked, table, types, nil
 }
 
-// create inserts a new record, mapping capacity and busy errors to the
-// application-level errors. It reports whether this call created the record
-// (true) or another goroutine published it first (false).
-func (s *Service) create(ctx context.Context, key string, build func(context.Context) (store.Record, error)) (store.Record, bool, error) {
-	createdRec, created, err := s.store.Create(ctx, key, build)
+// create inserts a new record into the given store, mapping capacity and busy
+// errors to the application-level errors. It reports whether this call created
+// the record (true) or another goroutine published it first (false).
+func (s *Service) create(ctx context.Context, st Store, key string, build func(context.Context) (store.Record, error)) (store.Record, bool, error) {
+	createdRec, created, err := st.Create(ctx, key, build)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrCapacity):

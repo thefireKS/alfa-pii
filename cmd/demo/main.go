@@ -170,7 +170,7 @@ func buildService(reg app.Registry, consumers []app.Consumer) (*app.Service, err
 		recognizer.PassportIssueDate, recognizer.Address, recognizer.CardHolderName,
 	}
 	m := masker.New("PII")
-	st := store.NewMemory(store.Limits{
+	processStore := store.NewMemory(store.Limits{
 		MaxEntries:      1000,
 		MaxBytes:        1 << 20,
 		MaxRecordBytes:  1 << 20,
@@ -178,8 +178,17 @@ func buildService(reg app.Registry, consumers []app.Consumer) (*app.Service, err
 		CreateWait:      time.Second,
 		CleanupInterval: time.Minute,
 	})
-	st.StartCleanup()
-	svc, err := app.NewManaged(reg, processTypes, consumers, st, m)
+	consumerStore := store.NewMemory(store.Limits{
+		MaxEntries:      1000,
+		MaxBytes:        1 << 20,
+		MaxRecordBytes:  1 << 20,
+		TTL:             24 * time.Hour,
+		CreateWait:      time.Second,
+		CleanupInterval: time.Minute,
+	})
+	processStore.StartCleanup()
+	consumerStore.StartCleanup()
+	svc, err := app.NewManaged(reg, processTypes, consumers, processStore, consumerStore, m)
 	if err != nil {
 		return nil, err
 	}

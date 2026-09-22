@@ -82,7 +82,9 @@ func main() {
 
 	m := masker.New(cfg.MarkerPrefix)
 	met := metrics.New()
-	st := store.NewMemory(store.Limits{
+	// The unauthenticated /process endpoint uses its own store so it cannot
+	// exhaust the capacity of the managed consumers' store.
+	processStore := store.NewMemory(store.Limits{
 		MaxEntries:      cfg.StoreMaxEntries,
 		MaxBytes:        cfg.StoreMaxBytes,
 		MaxRecordBytes:  cfg.StoreMaxRecordBytes,
@@ -90,10 +92,21 @@ func main() {
 		CreateWait:      cfg.StoreCreateWait,
 		CleanupInterval: cfg.StoreCleanupInterval,
 	})
-	st.SetObserver(storeObserver{met})
-	st.StartCleanup()
-	defer st.Stop()
-	svc, err := app.NewManaged(reg, processTypes, consumers, st, m)
+	consumerStore := store.NewMemory(store.Limits{
+		MaxEntries:      cfg.StoreMaxEntries,
+		MaxBytes:        cfg.StoreMaxBytes,
+		MaxRecordBytes:  cfg.StoreMaxRecordBytes,
+		TTL:             cfg.StoreTTL,
+		CreateWait:      cfg.StoreCreateWait,
+		CleanupInterval: cfg.StoreCleanupInterval,
+	})
+	processStore.SetObserver(storeObserver{met})
+	consumerStore.SetObserver(storeObserver{met})
+	processStore.StartCleanup()
+	consumerStore.StartCleanup()
+	defer processStore.Stop()
+	defer consumerStore.Stop()
+	svc, err := app.NewManaged(reg, processTypes, consumers, processStore, consumerStore, m)
 	if err != nil {
 		logger.Error("build service", "error", err.Error())
 		os.Exit(1)
