@@ -42,10 +42,15 @@ type Record struct {
 	CreatedAt time.Time
 }
 
-// Replacement maps a marker to the original value it stands for.
+// Replacement maps a marker to the byte range [Start, End) of the original
+// value it stands for. The range points into the record's Original text, so the
+// entity value is not duplicated in the table: the record holds the full
+// original once and the table only the markers and offsets. This keeps the
+// per-record size bounded for texts with many entities.
 type Replacement struct {
-	Marker   string
-	Original string
+	Marker string
+	Start  int
+	End    int
 }
 
 // Store is the storage contract used by the application layer.
@@ -453,11 +458,13 @@ func (s *Memory) reportFailure(reason string) {
 // recordSize estimates the bytes a record occupies in memory, including the
 // held key, the original text, the mask, the replacement table and fixed
 // overhead. The key is counted because a payload_id can be large enough to
-// dominate the request body and is stored as the map key.
+// dominate the request body and is stored as the map key. Each table entry
+// counts only its marker and fixed overhead: the original value is a range into
+// the record's Original text and is not duplicated.
 func recordSize(key string, rec Record) int64 {
 	size := int64(recordOverhead + len(key) + len(rec.Original) + len(rec.Masked))
 	for _, r := range rec.Table {
-		size += int64(replacementOverhead + len(r.Marker) + len(r.Original))
+		size += int64(replacementOverhead + len(r.Marker))
 	}
 	return size
 }

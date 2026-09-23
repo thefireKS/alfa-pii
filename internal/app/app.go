@@ -332,7 +332,7 @@ func (s *Service) Restore(ctx context.Context, consumerName, payloadID, masked s
 		// Marker format: substitute the consumer's own markers inside the
 		// given text. Markers not in the table are left untouched.
 		log.Info("stage", "stage", "restoration")
-		return Result{Text: masker.Restore(masked, fromStoreTable(rec.Table)), Outcome: OutcomeRestore}, nil
+		return Result{Text: masker.Restore(masked, fromStoreTable(rec.Original, rec.Table)), Outcome: OutcomeRestore}, nil
 	}
 }
 
@@ -432,15 +432,15 @@ func (s *Service) create(ctx context.Context, st Store, key string, build func(c
 func toStoreTable(table []masker.Replacement) []store.Replacement {
 	out := make([]store.Replacement, 0, len(table))
 	for _, r := range table {
-		out = append(out, store.Replacement{Marker: r.Marker, Original: r.Original})
+		out = append(out, store.Replacement{Marker: r.Marker, Start: r.Start, End: r.End})
 	}
 	return out
 }
 
-func fromStoreTable(table []store.Replacement) []masker.Replacement {
+func fromStoreTable(original string, table []store.Replacement) []masker.Replacement {
 	out := make([]masker.Replacement, 0, len(table))
 	for _, r := range table {
-		out = append(out, masker.Replacement{Marker: r.Marker, Original: r.Original})
+		out = append(out, masker.Replacement{Marker: r.Marker, Original: original[r.Start:r.End]})
 	}
 	return out
 }

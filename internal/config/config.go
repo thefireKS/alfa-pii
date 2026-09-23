@@ -30,6 +30,12 @@ type Config struct {
 	// enforced before the body is read so that large bodies cannot exhaust
 	// memory.
 	MaxActiveRequests int
+	// MaxWorkingBytes caps the total estimated working memory of in-flight
+	// requests. Each request acquires a share proportional to its payload
+	// before processing; when the budget is exhausted the request is refused
+	// with 429. This bounds the transient memory of many concurrent large
+	// payloads, which the per-request body limit alone cannot guarantee.
+	MaxWorkingBytes int64
 
 	// StoreMaxEntries caps the number of stored correspondences.
 	StoreMaxEntries int
@@ -66,11 +72,12 @@ func Default() Config {
 		WriteTimeout:         10 * time.Second,
 		IdleTimeout:          60 * time.Second,
 		ShutdownTimeout:      10 * time.Second,
-		MaxBodyBytes:         1 << 20, // 1 MiB
+		MaxBodyBytes:         2 << 20, // 2 MiB: fits a 100k-token body with JSON escaping headroom
 		MaxActiveRequests:    200,
+		MaxWorkingBytes:      64 << 20, // 64 MiB total in-flight working budget
 		StoreMaxEntries:      100_000,
 		StoreMaxBytes:        64 << 20, // 64 MiB
-		StoreMaxRecordBytes:  1 << 20,  // 1 MiB per record
+		StoreMaxRecordBytes:  4 << 20,  // 4 MiB per record
 		StoreTTL:             24 * time.Hour,
 		StoreCreateWait:      5 * time.Second,
 		StoreCleanupInterval: time.Minute,
@@ -128,6 +135,13 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("PII_MAX_ACTIVE_REQUESTS: %w", err)
 		}
 		cfg.MaxActiveRequests = n
+	}
+	if v := os.Getenv("PII_MAX_WORKING_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return Config{}, fmt.Errorf("PII_MAX_WORKING_BYTES: %w", err)
+		}
+		cfg.MaxWorkingBytes = n
 	}
 	if v := os.Getenv("PII_STORE_MAX_ENTRIES"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -217,6 +231,9 @@ func (c Config) Validate() error {
 	}
 	if c.MaxActiveRequests <= 0 {
 		errs = append(errs, errors.New("max active requests must be positive"))
+	}
+	if c.MaxWorkingBytes <= 0 {
+		errs = append(errs, errors.New("max working bytes must be positive"))
 	}
 	if c.StoreMaxEntries <= 0 {
 		errs = append(errs, errors.New("store max entries must be positive"))

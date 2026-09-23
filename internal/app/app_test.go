@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -428,4 +430,98 @@ func contains(s, sub string) bool {
 		}
 		return false
 	})()
+}
+
+// TestProcessNumerousEntities verifies that a large text with many entities is
+// masked and restored exactly, so the per-record limit and the range-based
+// replacement table handle a dense entity list without truncation.
+func TestProcessNumerousEntities(t *testing.T) {
+	svc := newAllService()
+	ctx := context.Background()
+	var b strings.Builder
+	const n = 5000
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		fmt.Fprintf(&b, "email user%d@example.test", i)
+	}
+	original := b.String()
+	res, err := svc.Process(ctx, "id-numerous", original)
+	if err != nil {
+		t.Fatalf("mask: %v", err)
+	}
+	masked := res.Text
+	if masked == original {
+		t.Fatal("masked text equals original")
+	}
+	if contains(masked, "user0@example.test") || contains(masked, "user4999@example.test") {
+		t.Fatalf("masked text still contains an email")
+	}
+	res2, err := svc.Process(ctx, "id-numerous", masked)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if res2.Text != original {
+		t.Fatalf("restore length = %d, want %d", len(res2.Text), len(original))
+	}
+}
+
+// TestProcessSpecialCharacters verifies exact restoration for texts containing
+// Cyrillic, emoji, quotes and backslashes alongside recognized entities.
+func TestProcessSpecialCharacters(t *testing.T) {
+	svc := newAllService()
+	ctx := context.Background()
+	tests := []struct {
+		name     string
+		original string
+	}{
+		{name: "cyrillic", original: "почта a.b@example.com и телефон +7 (912) 345-67-89"},
+		{name: "emoji", original: "привет 👋 email a.b@example.com конец 🎉"},
+		{name: "quotes", original: `email "a.b@example.com" и "телефон +7 (912) 345-67-89"`},
+		{name: "backslashes", original: `путь C:\data\a.b@example.com и телефон +7 (912) 345-67-89`},
+		{name: "mixed", original: `"ФИО: Иванов Иван Иванович" 👋 email a.b@example.com \ путь`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := svc.Process(ctx, "id-special-"+tt.name, tt.original)
+			if err != nil {
+				t.Fatalf("mask: %v", err)
+			}
+			masked := res.Text
+			res2, err := svc.Process(ctx, "id-special-"+tt.name, masked)
+			if err != nil {
+				t.Fatalf("restore: %v", err)
+			}
+			if res2.Text != tt.original {
+				t.Fatalf("restore = %q, want %q", res2.Text, tt.original)
+			}
+		})
+	}
+}
+
+// TestProcessLargeTextCycle verifies the full mask -> restore cycle for a large
+// text (~100k tokens by the runes/4 estimate) with a single entity, exercising
+// the raised per-record limit and the working budget.
+func TestProcessLargeTextCycle(t *testing.T) {
+	st := store.NewMemory(store.Limits{MaxEntries: 10, MaxBytes: 64 << 20, MaxRecordBytes: 4 << 20, TTL: time.Hour, CreateWait: time.Second})
+	svc := New(allRecognizers(), st, masker.New("PII"))
+	ctx := context.Background()
+	// ~400k runes ~= 100k tokens by the runes/4 estimate.
+	original := strings.Repeat("клиент ", 80000) + "email a.b@example.com"
+	res, err := svc.Process(ctx, "id-large", original)
+	if err != nil {
+		t.Fatalf("mask: %v", err)
+	}
+	masked := res.Text
+	if contains(masked, "a.b@example.com") {
+		t.Fatalf("masked text still contains the email")
+	}
+	res2, err := svc.Process(ctx, "id-large", masked)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if res2.Text != original {
+		t.Fatalf("restore length = %d, want %d", len(res2.Text), len(original))
+	}
 }

@@ -257,6 +257,35 @@ func TestProcessActiveLimit(t *testing.T) {
 	<-h.active
 }
 
+// TestProcessWorkingBudget verifies that the total working-memory budget is
+// enforced: when the budget is exhausted, a request is refused with 429 and
+// Retry-After, and a request that fits is processed. The budget is acquired
+// before the body is read, based on the declared Content-Length.
+func TestProcessWorkingBudget(t *testing.T) {
+	h := newTestHandler(10, 1<<20)
+	// A request with a 100-byte payload has a body of ~132 bytes and acquires
+	// 4*132 ~= 528 bytes. A budget of 600 fits exactly one such request.
+	h.SetWorkingBudget(600)
+	// Occupy the budget with an in-flight request.
+	if !h.working.acquire(600) {
+		t.Fatal("failed to acquire working budget")
+	}
+	// The budget is now exhausted; a request is refused with 429.
+	rec := doPost(t, h, `{"payload":"`+strings.Repeat("b", 100)+`","payload_id":"id-2"}`)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429; body=%q", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatal("missing Retry-After header")
+	}
+	h.working.release(600)
+	// After release, a request that fits is processed.
+	rec2 := doPost(t, h, `{"payload":"`+strings.Repeat("a", 100)+`","payload_id":"id-1"}`)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec2.Code, rec2.Body.String())
+	}
+}
+
 func TestLivezReadyz(t *testing.T) {
 	h := newTestHandler(10, 1<<20)
 	rec := httptest.NewRecorder()

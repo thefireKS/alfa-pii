@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -83,6 +84,7 @@ type Handler struct {
 	ready   func() bool
 	active  chan struct{}
 	maxBody int64
+	working *workingBudget
 	logger  *slog.Logger
 	metrics *metrics.Metrics
 }
@@ -103,9 +105,17 @@ func NewHandler(svc Service, auth *Authenticator, ready func() bool, maxActive i
 		ready:   ready,
 		active:  make(chan struct{}, maxActive),
 		maxBody: maxBody,
+		working: newWorkingBudget(0),
 		logger:  logger,
 		metrics: m,
 	}
+}
+
+// SetWorkingBudget sets the total in-flight working-memory budget in bytes. It
+// must be called before the handler serves requests. A non-positive value
+// disables the budget.
+func (h *Handler) SetWorkingBudget(bytes int64) {
+	h.working = newWorkingBudget(bytes)
 }
 
 // Routes returns the HTTP mux with all endpoints registered.
@@ -179,6 +189,19 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request, operation strin
 			return
 		}
 	}
+
+	// Acquire a share of the total working-memory budget before the body is
+	// read, based on the declared Content-Length. This bounds the transient
+	// memory of many concurrent large payloads, including the body buffers that
+	// exist only while the request is being read. When the budget is exhausted
+	// the request is refused with 429.
+	working := estimateWorkingBytesFromBody(r.ContentLength, h.maxBody)
+	if !h.working.acquire(working) {
+		h.finishOverload(log, operation, start)
+		writeRetryAfter(w, "working memory budget exceeded")
+		return
+	}
+	defer h.working.release(working)
 
 	req, outcome, ok := h.decodeRequest(w, r)
 	if !ok {
@@ -361,4 +384,59 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		// The response is already committed; nothing more can be done.
 		_ = fmt.Errorf("encode response: %w", err)
 	}
+}
+
+// workingBudget is a weighted semaphore bounding the total estimated working
+// memory of in-flight requests. It is safe for concurrent use.
+type workingBudget struct {
+	mu    sync.Mutex
+	total int64
+	used  int64
+}
+
+// newWorkingBudget returns a budget with the given total. A non-positive total
+// disables the budget: acquire always succeeds.
+func newWorkingBudget(total int64) *workingBudget {
+	return &workingBudget{total: total}
+}
+
+// acquire reserves n bytes of the budget. It reports false when the budget is
+// exhausted and reserves nothing.
+func (b *workingBudget) acquire(n int64) bool {
+	if b.total <= 0 {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.used+n > b.total {
+		return false
+	}
+	b.used += n
+	return true
+}
+
+// release returns n bytes to the budget. It must be called exactly once for
+// every successful acquire.
+func (b *workingBudget) release(n int64) {
+	if b.total <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.used -= n
+}
+
+// estimateWorkingBytesFromBody approximates the peak transient working memory
+// of processing one request from its declared Content-Length: the body buffer
+// while it is read, the decoded payload, the masked output and the replacement
+// table. The masked output and table can each approach the payload size
+// (markers can be longer than short entities), so a conservative multiple of
+// the body length is used. For chunked requests (Content-Length -1) the body
+// limit is used as the upper bound. The estimate is validated against RSS and
+// is never presented as an exact byte count.
+func estimateWorkingBytesFromBody(contentLength, maxBody int64) int64 {
+	if contentLength <= 0 {
+		contentLength = maxBody
+	}
+	return 4 * contentLength
 }

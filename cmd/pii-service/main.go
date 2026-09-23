@@ -115,6 +115,7 @@ func main() {
 	ready := func() bool { return true }
 	auth := httpapi.NewAuthenticator(secrets)
 	h := httpapi.NewHandler(svc, auth, ready, cfg.MaxActiveRequests, cfg.MaxBodyBytes, logger, met)
+	h.SetWorkingBudget(cfg.MaxWorkingBytes)
 
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,

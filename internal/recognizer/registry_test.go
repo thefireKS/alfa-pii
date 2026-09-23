@@ -62,9 +62,18 @@ func TestRegistryRegexpRuleMaxMatches(t *testing.T) {
 		t.Fatalf("AddRegexpRule: %v", err)
 	}
 	recs, _, _ := r.Recognizers([]Type{"t"})
-	frags, _ := recs[0].Find("x x x x")
+	// Exactly MaxMatches matches are returned.
+	frags, err := recs[0].Find("x x")
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
 	if len(frags) != 2 {
-		t.Fatalf("frags = %d, want 2 (capped)", len(frags))
+		t.Fatalf("frags = %d, want 2", len(frags))
+	}
+	// More than MaxMatches matches fail closed so no personal data is left
+	// exposed by silently truncating the list.
+	if _, err := recs[0].Find("x x x x"); !errors.Is(err, ErrTooManyMatches) {
+		t.Fatalf("Find overflow err = %v, want ErrTooManyMatches", err)
 	}
 }
 

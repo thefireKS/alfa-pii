@@ -12,6 +12,11 @@ var ErrUnknownType = errors.New("unknown data type")
 // ErrInvalidRule is returned when a config-driven regexp rule is invalid.
 var ErrInvalidRule = errors.New("invalid regexp rule")
 
+// ErrTooManyMatches is returned when a regexp rule finds more fragments than
+// its MaxMatches limit. The operation fails closed so no partially masked text
+// with exposed personal data is produced.
+var ErrTooManyMatches = errors.New("too many matches")
+
 // RegexpRule is a config-driven recognition rule. It lets a new data type be
 // added without new Go code: the pattern is compiled at startup, the type and
 // priority are configured, and the number of matches per text is bounded.
@@ -139,11 +144,16 @@ func (r *Registry) Recognizers(types []Type) ([]Recognizer, func(Type) int, erro
 func (r *RegexpRule) Type() Type { return r.DataType }
 
 // Find implements Recognizer. It returns at most MaxMatches fragments so a
-// pathological text cannot produce an unbounded result.
+// pathological text cannot produce an unbounded result. The match limit is
+// applied to the regexp search itself (FindAllStringIndex with a bounded n), so
+// a text with more matches than the limit does not allocate an unbounded result
+// slice. When the number of matches exceeds MaxMatches the rule fails closed
+// with ErrTooManyMatches: silently truncating the list would leave the excess
+// personal data unmasked and exposed.
 func (r *RegexpRule) Find(text string) ([]Fragment, error) {
-	idx := r.re.FindAllStringIndex(text, -1)
+	idx := r.re.FindAllStringIndex(text, r.MaxMatches+1)
 	if len(idx) > r.MaxMatches {
-		idx = idx[:r.MaxMatches]
+		return nil, fmt.Errorf("%w: type %q: more than %d matches", ErrTooManyMatches, r.DataType, r.MaxMatches)
 	}
 	frags := make([]Fragment, 0, len(idx))
 	for _, m := range idx {

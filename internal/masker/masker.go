@@ -16,10 +16,14 @@ type Range struct {
 	End   int
 }
 
-// Replacement maps a marker to the original value it stands for.
+// Replacement maps a marker to the original value it stands for. Start and End
+// are the byte range of the value in the original text; they let the store keep
+// the value as a range into the original instead of duplicating it.
 type Replacement struct {
 	Marker   string
 	Original string
+	Start    int
+	End      int
 }
 
 // Masker turns recognized fragments into markers.
@@ -55,7 +59,7 @@ func (m *Masker) Mask(text string, ranges []Range) (string, []Replacement) {
 		marker, n := m.nextMarker(used, next)
 		next = n + 1
 		b.WriteString(marker)
-		table = append(table, Replacement{Marker: marker, Original: text[r.Start:r.End]})
+		table = append(table, Replacement{Marker: marker, Original: text[r.Start:r.End], Start: r.Start, End: r.End})
 		last = r.End
 	}
 	b.WriteString(text[last:])
@@ -78,7 +82,7 @@ func Stars(text string, ranges []Range) (string, []Replacement) {
 	for _, r := range merged {
 		b.WriteString(text[last:r.Start])
 		b.WriteString(starRun)
-		table = append(table, Replacement{Marker: starRun, Original: text[r.Start:r.End]})
+		table = append(table, Replacement{Marker: starRun, Original: text[r.Start:r.End], Start: r.Start, End: r.End})
 		last = r.End
 	}
 	b.WriteString(text[last:])
@@ -92,40 +96,34 @@ const starRun = "****"
 // table. Markers not present in the table are left untouched. Substitution is a
 // single left-to-right pass: an original value inserted by an earlier marker is
 // never re-scanned, so a value that itself looks like a marker is not
-// substituted again.
+// substituted again. Each marker is parsed directly from the text and looked up
+// in the table, so the cost is linear in the text length and does not grow with
+// the number of distinct markers.
 func Restore(masked string, table []Replacement) string {
 	if len(table) == 0 {
 		return masked
 	}
-	// Map each marker to its original. Match the longest marker first so a
-	// marker that is a prefix of another does not shadow it.
 	byMarker := make(map[string]string, len(table))
-	markers := make([]string, 0, len(table))
 	for _, r := range table {
 		if _, ok := byMarker[r.Marker]; !ok {
 			byMarker[r.Marker] = r.Original
-			markers = append(markers, r.Marker)
 		}
 	}
-	sort.Slice(markers, func(i, j int) bool {
-		return len(markers[i]) > len(markers[j])
-	})
 	var b strings.Builder
 	b.Grow(len(masked))
 	for i := 0; i < len(masked); {
 		// Markers start with '[', so skip the marker loop for other bytes.
 		if masked[i] == '[' {
-			matched := false
-			for _, mk := range markers {
-				if strings.HasPrefix(masked[i:], mk) {
-					b.WriteString(byMarker[mk])
+			// Parse the marker up to its closing bracket and look it up. Markers
+			// are of the form [prefix_N], so the closing bracket delimits the
+			// exact marker and no longest-first scan over all markers is needed.
+			if j := strings.IndexByte(masked[i:], ']'); j >= 0 {
+				mk := masked[i : i+j+1]
+				if orig, ok := byMarker[mk]; ok {
+					b.WriteString(orig)
 					i += len(mk)
-					matched = true
-					break
+					continue
 				}
-			}
-			if matched {
-				continue
 			}
 		}
 		b.WriteByte(masked[i])

@@ -15,8 +15,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,7 +67,7 @@ func main() {
 
 	switch {
 	case *largeText:
-		runLargeText(ctx, client, *base, *outDir, *seed)
+		runLargeText(ctx, client, poller, *base, *outDir, *seed)
 		return
 	case *scheduled:
 		runScheduled(ctx, client, poller, *base, *outDir, *seed, *target, *workers, *queue, *totalPairs, *restoreFrac, *small, *medium, *large)
@@ -203,13 +206,16 @@ func runPreparation(ctx context.Context, client *loadgen.Client, scenario loadge
 	return fmt.Sprintf("created %d/%d correspondences in %s, %d bytes, budget=%d", success, count, dur.Round(time.Millisecond), bytes, budget)
 }
 
-// runLargeText runs the large-text scenario up to the 100k-token limit.
-func runLargeText(ctx context.Context, client *loadgen.Client, base, outDir string, seed int64) {
+// runLargeText runs the large-text scenario up to the 100k-token limit. It
+// reports bytes, runes, the token estimation method, per-stage latency and peak
+// RSS. The report depends on the current service response: a text inside the
+// supported profile must mask and restore with HTTP 200, and exceeding the
+// declared limit must give a predictable failure.
+func runLargeText(ctx context.Context, client *loadgen.Client, poller *loadgen.MetricsPoller, base, outDir string, seed int64) {
 	// Token estimate is runes/4, so 100k tokens ~= 400k runes. Test a range of
 	// sizes in tokens: 10k, 50k, 100k.
 	tokenTargets := []int{10000, 50000, 100000}
 	gen := loadgen.NewTextGenerator(seed, loadgen.DefaultSizeProfile(), 120, 400, 2000)
-	stats := loadgen.NewStats()
 	var b strings.Builder
 	w := func(format string, args ...any) {
 		fmt.Fprintf(&b, format+"\n", args...)
@@ -217,9 +223,6 @@ func runLargeText(ctx context.Context, client *loadgen.Client, base, outDir stri
 	w("=== Large-text scenario ===")
 	w("Token estimate: runes/4 (no exact tokenizer). Sizes reported in bytes and chars.")
 	w("Seed: %d", seed)
-	w("Note: the store per-record limit (PII_STORE_MAX_RECORD_BYTES, default 1 MiB) bounds the")
-	w("mask->restore cycle. A 100k-token text (~748 KB) plus its mask exceeds 1 MiB, so the")
-	w("correspondence is rejected with 429. The mask operation itself succeeds; storage does not.")
 	for _, tokens := range tokenTargets {
 		runes := tokens * 4
 		text := buildLargeText(gen, runes)
@@ -227,7 +230,6 @@ func runLargeText(ctx context.Context, client *loadgen.Client, base, outDir stri
 		start := time.Now()
 		resp, _ := client.SendWithRetry(ctx, id, text, loadgen.DefaultRetryPolicy())
 		latency := time.Since(start)
-		stats.RecordChars(loadgen.OutcomeOK, resp.Status, latency, len(text), runeCount(text))
 		w("tokens=%d runes=%d bytes=%d chars=%d status=%d latency=%s result_len=%d",
 			tokens, runes, len(text), runeCount(text), resp.Status, latency.Round(time.Microsecond), len(resp.Result))
 		if resp.IsValidSuccess() {
@@ -239,6 +241,32 @@ func runLargeText(ctx context.Context, client *loadgen.Client, base, outDir stri
 			w("  restore status=%d latency=%s exact=%v", restoreResp.Status, restoreLatency.Round(time.Microsecond), ok)
 		}
 	}
+	// Numerous-entities case: a large text (~100k tokens) made of many emails.
+	// This exercises the per-record limit and the replacement table with a dense
+	// entity list, not just a single entity in a filler string.
+	runes := 400_000
+	text := buildManyEntitiesText(runes)
+	id := "large-many-entities"
+	start := time.Now()
+	resp, _ := client.SendWithRetry(ctx, id, text, loadgen.DefaultRetryPolicy())
+	latency := time.Since(start)
+	w("many_entities runes=%d bytes=%d chars=%d status=%d latency=%s result_len=%d",
+		runes, len(text), runeCount(text), resp.Status, latency.Round(time.Microsecond), len(resp.Result))
+	if resp.IsValidSuccess() {
+		start = time.Now()
+		restoreResp, _ := client.SendWithRetry(ctx, id, resp.Result, loadgen.DefaultRetryPolicy())
+		restoreLatency := time.Since(start)
+		ok := restoreResp.IsValidSuccess() && restoreResp.Result == text
+		w("  restore status=%d latency=%s exact=%v", restoreResp.Status, restoreLatency.Round(time.Microsecond), ok)
+	}
+	// Report peak RSS from the poller (docker stats for a container, or the
+	// service process for a local run).
+	poller.Poll(context.Background())
+	_, _, peakRSS := poller.Snapshot()
+	if peakRSS <= 0 {
+		peakRSS = measureServiceRSS(base)
+	}
+	w("peak_rss_bytes=%d", peakRSS)
 	writeFile(outDir, "large-text.txt", b.String())
 	fmt.Print(b.String())
 }
@@ -252,6 +280,50 @@ func buildLargeText(gen *loadgen.TextGenerator, runes int) string {
 		base += " " + gen.FillerWord()
 	}
 	return base
+}
+
+// buildManyEntitiesText builds a text of approximately the given rune count
+// made of many emails, so the mask and restore exercise a dense entity list.
+func buildManyEntitiesText(runes int) string {
+	var b strings.Builder
+	for i := 0; runeCount(b.String()) < runes; i++ {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		fmt.Fprintf(&b, "email user%d@example.test", i)
+	}
+	return b.String()
+}
+
+// measureServiceRSS returns the resident set size in bytes of the process
+// listening on the port of the given base URL, or 0 when it cannot be
+// determined. It is a fallback for local runs without a container.
+func measureServiceRSS(base string) int64 {
+	u, err := url.Parse(base)
+	if err != nil {
+		return 0
+	}
+	port := u.Port()
+	if port == "" {
+		port = "80"
+	}
+	out, err := exec.Command("lsof", "-ti", "tcp:"+port, "-s", "tcp:listen").Output()
+	if err != nil {
+		return 0
+	}
+	pid := strings.TrimSpace(string(out))
+	if pid == "" {
+		return 0
+	}
+	ps, err := exec.Command("ps", "-o", "rss=", "-p", pid).Output()
+	if err != nil {
+		return 0
+	}
+	kb, err := strconv.ParseInt(strings.TrimSpace(string(ps)), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return kb * 1024
 }
 
 // runScheduled runs the scheduled send mode.

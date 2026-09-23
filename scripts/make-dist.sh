@@ -79,6 +79,7 @@ internal/loadgen/stats.go
 internal/loadgen/textgen.go
 internal/masker/masker.go
 internal/masker/masker_test.go
+internal/masker/bench_test.go
 internal/metrics/metrics.go
 internal/metrics/metrics_test.go
 internal/recognizer/address.go

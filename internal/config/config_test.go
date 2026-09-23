@@ -39,6 +39,11 @@ func TestValidateRejectsInvalid(t *testing.T) {
 		t.Fatal("expected error for zero cleanup interval")
 	}
 	cfg = Default()
+	cfg.MaxWorkingBytes = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for zero max working bytes")
+	}
+	cfg = Default()
 	cfg.MarkerPrefix = ""
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for empty marker prefix")

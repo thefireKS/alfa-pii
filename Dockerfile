@@ -29,6 +29,12 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c
 
 COPY --from=builder /out/pii-service /pii-service
 
+# Run the Go GC more aggressively than the default (GOGC=100) so the heap does
+# not grow across bursts of large requests. The working-memory budget bounds
+# concurrent allocations, but the runtime heap can otherwise accumulate garbage
+# between bursts and approach the container memory limit.
+ENV GOGC=50
+
 # The service listens on the port configured by PII_LISTEN_ADDR. The default
 # is 8080; the port is exposed for documentation and host mapping.
 EXPOSE 8080

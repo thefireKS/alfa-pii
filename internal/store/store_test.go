@@ -461,3 +461,22 @@ func TestCounterSymmetric(t *testing.T) {
 		t.Fatalf("observer bytes = %d, want 0", bytes)
 	}
 }
+
+// TestRecordSizeCountsMarkersNotValues verifies that the range-based replacement
+// table counts only markers and overhead, not the original entity values, so a
+// record with many entities does not duplicate the original text in the table.
+func TestRecordSizeCountsMarkersNotValues(t *testing.T) {
+	original := strings.Repeat("email a.b@example.test; ", 100)
+	rec := Record{Original: original, Masked: original, Table: []Replacement{
+		{Marker: "[PII_0]", Start: 0, End: 20},
+		{Marker: "[PII_1]", Start: 22, End: 42},
+	}}
+	// The table entries must not add the entity value bytes (20 each); only the
+	// markers and fixed overhead are counted.
+	size := recordSize("k", rec)
+	base := int64(recordOverhead + len("k") + len(original) + len(original))
+	want := base + 2*int64(replacementOverhead+len("[PII_0]"))
+	if size != want {
+		t.Fatalf("recordSize = %d, want %d", size, want)
+	}
+}
