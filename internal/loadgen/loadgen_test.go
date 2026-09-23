@@ -111,14 +111,15 @@ func TestTextGeneratorDeterministic(t *testing.T) {
 func TestSequentialScenario(t *testing.T) {
 	gen := NewTextGenerator(1, DefaultSizeProfile(), 120, 400, 2000)
 	s := NewScenario(ScenarioConfig{Mode: ModeSequential, TotalPairs: 2, Seed: 1}, gen)
+	ctx := context.Background()
 	// Pair 0 forward.
-	st, ok := s.Next()
+	st, ok := s.Next(ctx)
 	if !ok || !st.IsMask {
 		t.Fatalf("expected mask step, got %+v ok=%v", st, ok)
 	}
 	s.Complete(st, Response{Status: 200, Outcome: OutcomeOK, Result: "mask0"})
 	// Pair 0 reverse is now available.
-	st, ok = s.Next()
+	st, ok = s.Next(ctx)
 	if !ok || st.IsMask {
 		t.Fatalf("expected restore step, got %+v ok=%v", st, ok)
 	}
@@ -127,7 +128,7 @@ func TestSequentialScenario(t *testing.T) {
 	}
 	// A restore must never be issued before its forward completes: with no
 	// completed forward, Next returns a new forward step.
-	st, ok = s.Next()
+	st, ok = s.Next(ctx)
 	if !ok || !st.IsMask {
 		t.Fatalf("expected mask step before any completed forward, got %+v ok=%v", st, ok)
 	}
@@ -136,12 +137,13 @@ func TestSequentialScenario(t *testing.T) {
 func TestMaskDominantScenario(t *testing.T) {
 	gen := NewTextGenerator(1, DefaultSizeProfile(), 120, 400, 2000)
 	s := NewScenario(ScenarioConfig{Mode: ModeMaskDominant, TotalPairs: 10, RestoreFraction: 0.5, Seed: 1}, gen)
+	ctx := context.Background()
 	// Issue mask steps and complete them to grow the pending set. With a
 	// restore fraction of 0.5, some steps may be restores; complete only the
 	// mask steps and stop once the pending set reaches 5.
 	masks := 0
 	for masks < 5 {
-		st, ok := s.Next()
+		st, ok := s.Next(ctx)
 		if !ok {
 			t.Fatalf("scenario exhausted before 5 masks, got %d", masks)
 		}
@@ -150,14 +152,14 @@ func TestMaskDominantScenario(t *testing.T) {
 			masks++
 		}
 	}
-	if s.Pending() != 5 {
-		t.Errorf("pending=%d want 5", s.Pending())
+	if s.Pending() < 5 {
+		t.Errorf("pending=%d want at least 5 (completed masks plus in-flight restores)", s.Pending())
 	}
 	// With restore fraction 0.5 and a non-empty pending set, some steps should
 	// be restores.
 	sawRestore := false
 	for i := 0; i < 50; i++ {
-		st, ok := s.Next()
+		st, ok := s.Next(ctx)
 		if !ok {
 			break
 		}
@@ -176,9 +178,10 @@ func TestMaskDominantScenario(t *testing.T) {
 // failed restore keeps the pair pending for a retry with the same ID and data.
 func TestMaskDominantRestoreCompletesPair(t *testing.T) {
 	gen := NewTextGenerator(1, DefaultSizeProfile(), 120, 400, 2000)
-	s := NewScenario(ScenarioConfig{Mode: ModeMaskDominant, TotalPairs: 10, RestoreFraction: 1.0, Seed: 1, RunID: "run"}, gen)
+	s := NewScenario(ScenarioConfig{Mode: ModeMaskDominant, TotalPairs: 10, RestoreFraction: 1.0, RestoreBudget: 2, Seed: 1, RunID: "run"}, gen)
+	ctx := context.Background()
 	// Issue one mask step and complete it so the pair enters pending.
-	st, ok := s.Next()
+	st, ok := s.Next(ctx)
 	if !ok || !st.IsMask {
 		t.Fatalf("expected mask step, got %+v ok=%v", st, ok)
 	}
@@ -187,7 +190,7 @@ func TestMaskDominantRestoreCompletesPair(t *testing.T) {
 		t.Fatalf("pending=%d want 1", s.Pending())
 	}
 	// A failed restore (error) keeps the pair pending.
-	rst, ok := s.Next()
+	rst, ok := s.Next(ctx)
 	if !ok || rst.IsMask {
 		t.Fatalf("expected restore step, got %+v ok=%v", rst, ok)
 	}
@@ -196,7 +199,7 @@ func TestMaskDominantRestoreCompletesPair(t *testing.T) {
 		t.Errorf("pending=%d want 1 after failed restore", s.Pending())
 	}
 	// A successful restore removes the pair from pending.
-	rst, ok = s.Next()
+	rst, ok = s.Next(ctx)
 	if !ok || rst.IsMask {
 		t.Fatalf("expected restore step, got %+v ok=%v", rst, ok)
 	}
@@ -206,7 +209,7 @@ func TestMaskDominantRestoreCompletesPair(t *testing.T) {
 	}
 	// The pair must not be selected again for restore.
 	for i := 0; i < 20; i++ {
-		st, ok := s.Next()
+		st, ok := s.Next(ctx)
 		if !ok {
 			break
 		}
@@ -219,11 +222,12 @@ func TestMaskDominantRestoreCompletesPair(t *testing.T) {
 func TestRestoreDominantScenarioBudget(t *testing.T) {
 	gen := NewTextGenerator(1, DefaultSizeProfile(), 120, 400, 2000)
 	s := NewScenario(ScenarioConfig{Mode: ModeRestoreDominant, TotalPairs: 0, RestoreFraction: 1.0, RestoreBudget: 2, Seed: 1, RunID: "run"}, gen)
+	ctx := context.Background()
 	rd := s.(*restoreDominant)
 	rd.AddPrepared("prep-run-0", "original0", "mask0", 2)
 	// With budget 2, exactly two restore steps for the pair.
 	for i := 0; i < 2; i++ {
-		st, ok := s.Next()
+		st, ok := s.Next(ctx)
 		if !ok || st.IsMask {
 			t.Fatalf("expected restore step %d, got %+v ok=%v", i, st, ok)
 		}
@@ -235,7 +239,7 @@ func TestRestoreDominantScenarioBudget(t *testing.T) {
 		}
 	}
 	// Budget exhausted; with no new pairs and no budget left, scenario ends.
-	if _, ok := s.Next(); ok {
+	if _, ok := s.Next(ctx); ok {
 		t.Error("expected scenario exhausted after budget")
 	}
 }
@@ -303,12 +307,18 @@ pii_requests_total{operation="process",outcome="mask"} 100`
 	sm.RequestsTotal = make(map[string]int64)
 	sm.StoreFailures = make(map[string]int64)
 	parseMetrics(body, &sm)
-	// Store metrics are summed across area/phase label combinations.
-	if sm.StoreRecords != 5210 {
-		t.Errorf("records=%d want 5210", sm.StoreRecords)
+	// Store metrics keep the phase breakdown.
+	if sm.StoreRecordsPending != 5000 {
+		t.Errorf("pending records=%d want 5000", sm.StoreRecordsPending)
 	}
-	if sm.StoreBytes != 4080030 {
-		t.Errorf("bytes=%d want 4080030", sm.StoreBytes)
+	if sm.StoreRecordsReplay != 210 {
+		t.Errorf("replay records=%d want 210", sm.StoreRecordsReplay)
+	}
+	if sm.StoreBytesPending != 4080000 {
+		t.Errorf("pending bytes=%d want 4080000", sm.StoreBytesPending)
+	}
+	if sm.StoreBytesReplay != 30 {
+		t.Errorf("replay bytes=%d want 30", sm.StoreBytesReplay)
 	}
 	if sm.StoreTTL != 3 {
 		t.Errorf("ttl=%d want 3", sm.StoreTTL)
@@ -477,7 +487,7 @@ type singleMaskScenario struct {
 	issued bool
 }
 
-func (s *singleMaskScenario) Next() (Step, bool) {
+func (s *singleMaskScenario) Next(ctx context.Context) (Step, bool) {
 	if s.issued {
 		return Step{}, false
 	}
@@ -519,7 +529,7 @@ func TestRunnerRecordsRetrySeries(t *testing.T) {
 	defer cancel()
 	runner.Run(ctx)
 
-	sent, maskSuccess, _, _, _ := runner.Counts()
+	sent, maskSuccess, _, _, _, _ := runner.Counts()
 	if sent != 3 {
 		t.Errorf("sent=%d want 3 (three HTTP sends)", sent)
 	}
@@ -571,7 +581,7 @@ func TestSchedulerRecordsRetrySeries(t *testing.T) {
 	defer cancel()
 	sched.Run(ctx)
 
-	_, sent, _, _, maskSuccess, _, _, _ := sched.Counts()
+	_, sent, _, _, maskSuccess, _, _, _, _, _ := sched.Counts()
 	if sent != 3 {
 		t.Errorf("sent=%d want 3 (three HTTP sends)", sent)
 	}
@@ -654,11 +664,12 @@ func TestRestoreDominantPrepSkipKeepsIDs(t *testing.T) {
 	// 1 and 2 were created, with their real payload_ids.
 	rd.AddPrepared("prep-run-1", "original1", "mask1", 1)
 	rd.AddPrepared("prep-run-2", "original2", "mask2", 1)
+	ctx := context.Background()
 	// The restore must use one of the stored IDs (never the skipped prep-run-0)
 	// and the mask stored under that exact ID.
 	seen := map[string]bool{}
 	for i := 0; i < 2; i++ {
-		st, ok := s.Next()
+		st, ok := s.Next(ctx)
 		if !ok || st.IsMask {
 			t.Fatalf("expected restore step %d, got %+v ok=%v", i, st, ok)
 		}
@@ -686,8 +697,9 @@ func TestRunIDEmbeddedInPayloadID(t *testing.T) {
 	gen2 := NewTextGenerator(7, DefaultSizeProfile(), 120, 400, 2000)
 	s1 := NewScenario(ScenarioConfig{Mode: ModeSequential, TotalPairs: 2, Seed: 7, RunID: "runA"}, gen1)
 	s2 := NewScenario(ScenarioConfig{Mode: ModeSequential, TotalPairs: 2, Seed: 7, RunID: "runB"}, gen2)
-	st1, _ := s1.Next()
-	st2, _ := s2.Next()
+	ctx := context.Background()
+	st1, _ := s1.Next(ctx)
+	st2, _ := s2.Next(ctx)
 	if st1.PayloadID == st2.PayloadID {
 		t.Errorf("payload_ids should differ across runs: %q", st1.PayloadID)
 	}
@@ -696,5 +708,220 @@ func TestRunIDEmbeddedInPayloadID(t *testing.T) {
 	}
 	if st1.Payload != st2.Payload {
 		t.Errorf("texts should be reproducible across runs: %q vs %q", st1.Payload, st2.Payload)
+	}
+}
+
+// TestClientRunEndNotTimeout verifies that an expired run context is classified
+// as run-ended, not as a per-request timeout. The server never receives a
+// request; the client must not report a timeout.
+func TestClientRunEndNotTimeout(t *testing.T) {
+	var calls int
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(200)
+	})
+	client := NewClient(srv.URL, 10, time.Second)
+	// A context that is already expired.
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	resp := client.Send(ctx, "id", "text")
+	if resp.Outcome != OutcomeRunEnded {
+		t.Errorf("outcome=%s want run_ended", resp.Outcome)
+	}
+	if calls != 0 {
+		t.Errorf("server received %d requests, want 0", calls)
+	}
+}
+
+// TestClientCanceledNotTimeout verifies that a cancelled run context is
+// classified as canceled, not as a timeout.
+func TestClientCanceledNotTimeout(t *testing.T) {
+	client := NewClient("http://127.0.0.1:1", 10, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	resp := client.Send(ctx, "id", "text")
+	if resp.Outcome != OutcomeCanceled {
+		t.Errorf("outcome=%s want canceled", resp.Outcome)
+	}
+}
+
+// TestSequentialInFlightOneRestore verifies that a restore step is issued to at
+// most one worker at a time: while a restore is in flight, Next does not issue
+// the same pair again, and a successful restore frees the pair's data.
+func TestSequentialInFlightOneRestore(t *testing.T) {
+	gen := NewTextGenerator(1, DefaultSizeProfile(), 120, 400, 2000)
+	s := NewScenario(ScenarioConfig{Mode: ModeSequential, TotalPairs: 1, RestoreBudget: 2, Seed: 1, RunID: "run"}, gen)
+	ctx := context.Background()
+	// Issue the mask and complete it.
+	st, ok := s.Next(ctx)
+	if !ok || !st.IsMask {
+		t.Fatalf("expected mask step, got %+v ok=%v", st, ok)
+	}
+	s.Complete(st, Response{Status: 200, Outcome: OutcomeOK, Result: "mask"})
+	if s.Pending() != 1 {
+		t.Fatalf("pending=%d want 1", s.Pending())
+	}
+	// Issue the restore; the pair is now in flight.
+	rst, ok := s.Next(ctx)
+	if !ok || rst.IsMask {
+		t.Fatalf("expected restore step, got %+v ok=%v", rst, ok)
+	}
+	if s.Pending() != 1 {
+		t.Errorf("pending=%d want 1 while restore in flight", s.Pending())
+	}
+	// A second Next must not issue the same pair again (it is in flight) and
+	// there are no new pairs, so it must block. Use a short timeout context.
+	shortCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if _, ok := s.Next(shortCtx); ok {
+		t.Error("expected no step while the only pair is in flight")
+	}
+	// A failed restore re-queues the pair within budget.
+	s.Complete(rst, Response{Status: 500, Outcome: OutcomeError})
+	if s.Pending() != 1 {
+		t.Errorf("pending=%d want 1 after failed restore", s.Pending())
+	}
+	// A successful restore frees the pair's data.
+	rst, ok = s.Next(ctx)
+	if !ok || rst.IsMask {
+		t.Fatalf("expected restore step, got %+v ok=%v", rst, ok)
+	}
+	s.Complete(rst, Response{Status: 200, Outcome: OutcomeOK, Result: rst.Original})
+	if s.Pending() != 0 {
+		t.Errorf("pending=%d want 0 after successful restore", s.Pending())
+	}
+	// The scenario is now exhausted.
+	if _, ok := s.Next(ctx); ok {
+		t.Error("expected scenario exhausted after pair completed")
+	}
+}
+
+// TestSequentialFreesData verifies that completed pairs free their stored data
+// so the generator's memory stays bounded over a long run.
+func TestSequentialFreesData(t *testing.T) {
+	gen := NewTextGenerator(1, DefaultSizeProfile(), 120, 400, 2000)
+	s := NewScenario(ScenarioConfig{Mode: ModeSequential, TotalPairs: 2, RestoreBudget: 1, Seed: 1, RunID: "run"}, gen)
+	ctx := context.Background()
+	seq := s.(*sequential)
+	// Complete both pairs fully.
+	for i := 0; i < 2; i++ {
+		st, ok := s.Next(ctx)
+		if !ok || !st.IsMask {
+			t.Fatalf("expected mask step, got %+v ok=%v", st, ok)
+		}
+		s.Complete(st, Response{Status: 200, Outcome: OutcomeOK, Result: "mask" + st.PayloadID})
+		rst, ok := s.Next(ctx)
+		if !ok || rst.IsMask {
+			t.Fatalf("expected restore step, got %+v ok=%v", rst, ok)
+		}
+		s.Complete(rst, Response{Status: 200, Outcome: OutcomeOK, Result: rst.Original})
+	}
+	if len(seq.masks) != 0 || len(seq.originals) != 0 {
+		t.Errorf("completed pairs not freed: masks=%d originals=%d", len(seq.masks), len(seq.originals))
+	}
+	if s.Pending() != 0 {
+		t.Errorf("pending=%d want 0", s.Pending())
+	}
+}
+
+// TestRestoreDelayPause verifies that a restore step is not issued until the
+// configured delay after the mask completes.
+func TestRestoreDelayPause(t *testing.T) {
+	gen := NewTextGenerator(1, DefaultSizeProfile(), 120, 400, 2000)
+	s := NewScenario(ScenarioConfig{Mode: ModeSequential, TotalPairs: 1, RestoreBudget: 1, RestoreDelay: 100 * time.Millisecond, Seed: 1, RunID: "run"}, gen)
+	ctx := context.Background()
+	st, ok := s.Next(ctx)
+	if !ok || !st.IsMask {
+		t.Fatalf("expected mask step, got %+v ok=%v", st, ok)
+	}
+	s.Complete(st, Response{Status: 200, Outcome: OutcomeOK, Result: "mask"})
+	// Before the delay elapses, Next must not issue the restore.
+	shortCtx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	defer cancel()
+	if _, ok := s.Next(shortCtx); ok {
+		t.Error("expected no restore before the delay elapses")
+	}
+	// After the delay, the restore becomes available.
+	rst, ok := s.Next(ctx)
+	if !ok || rst.IsMask {
+		t.Fatalf("expected restore step after delay, got %+v ok=%v", rst, ok)
+	}
+}
+
+// TestRunnerRunEndDoesNotTriggerCompatStop verifies that when the run context
+// deadline expires, the runner stops with a context-done reason, not "five
+// consecutive invalid responses". The server hangs so in-flight requests are
+// cut off by the run end.
+func TestRunnerRunEndDoesNotTriggerCompatStop(t *testing.T) {
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		// Hold the request open until the client cancels it or a timeout
+		// elapses, so requests are in flight when the run ends.
+		select {
+		case <-r.Context().Done():
+		case <-time.After(500 * time.Millisecond):
+		}
+		w.WriteHeader(200)
+	})
+	client := NewClient(srv.URL, 10, time.Second)
+	gen := NewTextGenerator(1, DefaultSizeProfile(), 120, 400, 2000)
+	scenario := NewScenario(ScenarioConfig{Mode: ModeSequential, TotalPairs: 1000, Seed: 1, RunID: "run"}, gen)
+	pacer := NewPacer(PacerConfig{Target: 1000, Ramp: 0, Queue: 16})
+	defer pacer.Stop()
+	runner := NewRunner(client, scenario, pacer, RunnerConfig{
+		Workers:               4,
+		Retry:                 RetryPolicy{MaxAttempts: 1, BaseDelay: time.Millisecond},
+		MaxConsecutiveInvalid: 5,
+		Grace:                 50 * time.Millisecond,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	reason := runner.Run(ctx)
+	if reason == "five consecutive invalid responses" {
+		t.Errorf("run end must not trigger the compatibility stop, got %q", reason)
+	}
+	if !strings.Contains(reason, "context done") {
+		t.Errorf("stop reason=%q want context done", reason)
+	}
+}
+
+// TestSchedulerSharedBudget verifies that initial attempts and retries share one
+// common HTTP budget: the total sends (including retries) stay within the
+// configured rate over the measured interval.
+func TestSchedulerSharedBudget(t *testing.T) {
+	var n int
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		n++
+		if n%2 == 1 {
+			w.WriteHeader(429)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]string{"result": "masked"})
+	})
+	client := NewClient(srv.URL, 10, time.Second)
+	gen := NewTextGenerator(1, DefaultSizeProfile(), 120, 400, 2000)
+	scenario := NewScenario(ScenarioConfig{Mode: ModeSequential, TotalPairs: 100000, Seed: 1, RunID: "run"}, gen)
+	sched := NewScheduler(client, scenario, SchedulerConfig{
+		Target:                200,
+		Workers:               4,
+		Queue:                 16,
+		Retry:                 RetryPolicy{MaxAttempts: 2, BaseDelay: time.Millisecond},
+		MaxConsecutiveInvalid: 5,
+		Grace:                 50 * time.Millisecond,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	sched.Run(ctx)
+	measured := sched.Measured()
+	if measured <= 0 {
+		t.Fatalf("measured=%s want > 0", measured)
+	}
+	_, sent, _, _, _, _, _, _, _, _ := sched.Counts()
+	// The achieved send rate (including retries) must not exceed the target by
+	// a large margin; a shared budget keeps it near the target.
+	rate := float64(sent) / measured.Seconds()
+	if rate > 200*1.5 {
+		t.Errorf("achieved send rate=%.1f exceeds shared budget target 200 by >50%%", rate)
 	}
 }

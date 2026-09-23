@@ -23,15 +23,17 @@ type Outcome string
 
 // Request outcomes. The set is fixed and bounded.
 const (
-	OutcomeOK       Outcome = "ok"       // HTTP 200 with a valid string result
-	OutcomeMask     Outcome = "mask"     // a new mask was created (classified)
-	OutcomeRestore  Outcome = "restore"  // a restoration was performed (classified)
-	OutcomeRepeat   Outcome = "repeat"   // a stored result was returned (classified)
-	OutcomeConflict Outcome = "conflict" // 409
-	OutcomeOverload Outcome = "overload" // 429
-	OutcomeError    Outcome = "error"    // 5xx or transport error
-	OutcomeTimeout  Outcome = "timeout" // client timeout
-	OutcomeInvalid  Outcome = "invalid" // malformed response
+	OutcomeOK       Outcome = "ok"        // HTTP 200 with a valid string result
+	OutcomeMask     Outcome = "mask"      // a new mask was created (classified)
+	OutcomeRestore  Outcome = "restore"   // a restoration was performed (classified)
+	OutcomeRepeat   Outcome = "repeat"    // a stored result was returned (classified)
+	OutcomeConflict Outcome = "conflict"  // 409
+	OutcomeOverload Outcome = "overload"  // 429
+	OutcomeError    Outcome = "error"     // 5xx or transport error
+	OutcomeTimeout  Outcome = "timeout"   // client timeout on a single request
+	OutcomeRunEnded Outcome = "run_ended" // the run context deadline expired
+	OutcomeCanceled Outcome = "canceled"  // the run context was cancelled
+	OutcomeInvalid  Outcome = "invalid"   // malformed response
 )
 
 // Response is the classified result of one request attempt.
@@ -109,6 +111,15 @@ func (c *Client) Send(ctx context.Context, payloadID, payload string) Response {
 	resp, err := c.http.Do(req)
 	ttfb := time.Since(start)
 	if err != nil {
+		// Distinguish the end of the whole run from a real per-request timeout.
+		// When the passed context is done, the request was cut off by the run
+		// ending (deadline) or being cancelled, not by the client's own timeout.
+		if ctx.Err() == context.DeadlineExceeded {
+			return Response{Outcome: OutcomeRunEnded, Latency: ttfb, TTFB: ttfb, Err: err}
+		}
+		if ctx.Err() == context.Canceled {
+			return Response{Outcome: OutcomeCanceled, Latency: ttfb, TTFB: ttfb, Err: err}
+		}
 		if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
 			return Response{Outcome: OutcomeTimeout, Latency: ttfb, TTFB: ttfb, Err: err}
 		}

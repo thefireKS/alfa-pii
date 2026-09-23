@@ -13,6 +13,13 @@ import (
 // skip. This separates the target rate from the achieved rate and makes skips
 // visible. The pacer never blocks, so the target rate is always maintained even
 // when workers are busy waiting for responses.
+//
+// The send plan is computed from the actual elapsed monotonic time and the
+// configured profile, not from a fixed per-tick increment. When the timer fires
+// late (GC pause, scheduler delay), the missed time is accrued so the achieved
+// rate stays on target. Catch-up is bounded: at most MaxBurst slots are emitted
+// per iteration, and slots that remain due beyond the cap are counted as
+// overdue rather than sent as one unbounded burst.
 type Pacer struct {
 	// target is the steady-state rate in requests per second.
 	target float64
@@ -24,12 +31,17 @@ type Pacer struct {
 	burstDuration time.Duration
 	// ramp is the duration over which the rate ramps up to target.
 	ramp time.Duration
+	// maxBurst bounds the number of slots emitted per iteration.
+	maxBurst int
 	// slotCh is the bounded channel of pending send slots.
 	slotCh chan struct{}
 	// granted counts slots emitted by the pacer.
 	granted int64
 	// skipped counts slots dropped because the queue was full.
 	skipped int64
+	// overdue counts slots that were due but not emitted because of the burst
+	// cap. They are accounted explicitly rather than silently dropped.
+	overdue int64
 	// consumed counts slots actually taken by workers.
 	consumed int64
 	// start is the wall-clock start of the run.
@@ -55,6 +67,9 @@ type PacerConfig struct {
 	Ramp time.Duration
 	// Queue is the maximum number of pending slots (bounded queue).
 	Queue int
+	// MaxBurst bounds the number of slots emitted per iteration. When zero, a
+	// default of 1 is used so a timer delay cannot cause an unbounded burst.
+	MaxBurst int
 }
 
 // NewPacer builds a pacer and starts its goroutine.
@@ -65,12 +80,16 @@ func NewPacer(cfg PacerConfig) *Pacer {
 	if cfg.Queue <= 0 {
 		cfg.Queue = 1
 	}
+	if cfg.MaxBurst <= 0 {
+		cfg.MaxBurst = 1
+	}
 	p := &Pacer{
 		target:        cfg.Target,
 		peak:          cfg.Peak,
 		burstEvery:    cfg.BurstEvery,
 		burstDuration: cfg.BurstDuration,
 		ramp:          cfg.Ramp,
+		maxBurst:      cfg.MaxBurst,
 		slotCh:        make(chan struct{}, cfg.Queue),
 		start:         time.Now(),
 		done:          make(chan struct{}),
@@ -80,26 +99,42 @@ func NewPacer(cfg PacerConfig) *Pacer {
 	return p
 }
 
-// run emits slots at the current rate using a fractional accumulator. The rate
-// ramps from a low fraction to the target over the ramp period, then holds.
+// run emits slots according to the actual elapsed monotonic time. Each
+// iteration accrues the slots owed since the previous iteration (rate *
+// elapsed), emits at most maxBurst of them, and counts the remainder as
+// overdue so the accumulator stays bounded.
 func (p *Pacer) run() {
 	defer p.wg.Done()
 	const tick = time.Millisecond
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
-	var acc float64
+	var due float64
+	last := time.Now()
 	for {
 		select {
 		case <-p.done:
 			return
 		case <-ticker.C:
-			elapsed := time.Since(p.start)
-			rate := p.currentRate(elapsed)
-			// Slots per tick = rate * tickSeconds.
-			acc += rate * tick.Seconds()
-			for acc >= 1 {
-				acc--
+			now := time.Now()
+			elapsed := now.Sub(last)
+			last = now
+			rate := p.currentRate(now.Sub(p.start))
+			due += rate * elapsed.Seconds()
+			emit := int(due)
+			if emit > p.maxBurst {
+				emit = p.maxBurst
+			}
+			for i := 0; i < emit; i++ {
 				p.emit()
+			}
+			due -= float64(emit)
+			if due >= 1 {
+				// Slots that could not be emitted within the burst cap are
+				// accounted explicitly as overdue and dropped from the
+				// accumulator so it stays bounded.
+				overdue := int(due)
+				atomic.AddInt64(&p.overdue, int64(overdue))
+				due -= float64(overdue)
 			}
 		}
 	}
@@ -155,4 +190,10 @@ func (p *Pacer) Stop() {
 // Counts returns the granted, consumed and skipped slot counts.
 func (p *Pacer) Counts() (granted, consumed, skipped int64) {
 	return atomic.LoadInt64(&p.granted), atomic.LoadInt64(&p.consumed), atomic.LoadInt64(&p.skipped)
+}
+
+// Overdue returns the number of slots that were due but not emitted because of
+// the per-iteration burst cap.
+func (p *Pacer) Overdue() int64 {
+	return atomic.LoadInt64(&p.overdue)
 }

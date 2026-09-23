@@ -42,7 +42,8 @@ func main() {
 		container     = flag.String("container", "pii-service", "container name for docker stats")
 		prep          = flag.Int("prep", 0, "preparation count for restore_dominant")
 		restoreFrac   = flag.Float64("restore-fraction", 0.5, "fraction of restore steps")
-		restoreBudget = flag.Int("restore-budget", 1, "max restores per pair in restore_dominant")
+		restoreBudget = flag.Int("restore-budget", 1, "max restore attempts per pair")
+		restoreDelay  = flag.Duration("restore-delay", 0, "pause between a completed mask and its restore step")
 		totalPairs    = flag.Int("pairs", 100000, "total distinct payload_ids")
 		small         = flag.Int("small", 120, "small payload size in chars")
 		medium        = flag.Int("medium", 400, "medium payload size in chars")
@@ -51,6 +52,7 @@ func main() {
 		scheduled     = flag.Bool("scheduled", false, "run the scheduled send mode")
 		compat        = flag.Bool("compat", false, "run the compatibility check")
 		queue         = flag.Int("queue", 64, "pacer/scheduler queue size")
+		grace         = flag.Duration("grace", 2*time.Second, "drain grace for in-flight requests after the run")
 		prepTimeout   = flag.Duration("prep-timeout", 10*time.Minute, "timeout for the restore_dominant preparation phase")
 	)
 	flag.Parse()
@@ -66,12 +68,15 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *duration)
 	defer cancel()
 
+	runID := newRunID()
+	command := strings.Join(os.Args, " ")
+
 	switch {
 	case *largeText:
 		runLargeText(ctx, client, poller, *base, *outDir, *seed)
 		return
 	case *scheduled:
-		runScheduled(ctx, client, poller, *base, *outDir, *seed, *target, *workers, *queue, *totalPairs, *restoreFrac, *small, *medium, *large)
+		runScheduled(ctx, client, poller, *base, *outDir, *seed, *target, *workers, *queue, *totalPairs, *restoreFrac, *restoreBudget, *restoreDelay, *small, *medium, *large, *grace, runID, command)
 		return
 	case *compat:
 		runCompat(ctx, client, *base, *outDir, *seed, *small, *medium, *large)
@@ -79,8 +84,8 @@ func main() {
 	}
 
 	runMain(client, poller, loadgen.Mode(*mode), *base, *outDir, *seed,
-		*target, *peak, *ramp, *burstEvery, *burstDur, *workers, *queue, *prep, *restoreFrac, *restoreBudget,
-		*totalPairs, *small, *medium, *large, *duration, *prepTimeout)
+		*target, *peak, *ramp, *burstEvery, *burstDur, *workers, *queue, *prep, *restoreFrac, *restoreBudget, *restoreDelay,
+		*totalPairs, *small, *medium, *large, *duration, *grace, *prepTimeout, runID, command)
 }
 
 // runMain runs the main load profile. The preparation phase (restore_dominant)
@@ -88,8 +93,8 @@ func main() {
 // reported duration covers only the measured part.
 func runMain(client *loadgen.Client, poller *loadgen.MetricsPoller,
 	mode loadgen.Mode, base, outDir string, seed int64, target, peak float64, ramp, burstEvery, burstDur time.Duration,
-	workers, queue, prep int, restoreFrac float64, restoreBudget, totalPairs, small, medium, large int,
-	duration, prepTimeout time.Duration) {
+	workers, queue, prep int, restoreFrac float64, restoreBudget int, restoreDelay time.Duration,
+	totalPairs, small, medium, large int, duration, grace, prepTimeout time.Duration, runID, command string) {
 
 	gen := loadgen.NewTextGenerator(seed, loadgen.DefaultSizeProfile(), small, medium, large)
 	cfg := loadgen.ScenarioConfig{
@@ -97,8 +102,9 @@ func runMain(client *loadgen.Client, poller *loadgen.MetricsPoller,
 		TotalPairs:      totalPairs,
 		RestoreFraction: restoreFrac,
 		RestoreBudget:   restoreBudget,
+		RestoreDelay:    restoreDelay,
 		Seed:            seed,
-		RunID:           newRunID(),
+		RunID:           runID,
 	}
 
 	scenario := loadgen.NewScenario(cfg, gen)
@@ -129,6 +135,7 @@ func runMain(client *loadgen.Client, poller *loadgen.MetricsPoller,
 		Workers:               workers,
 		Retry:                 loadgen.DefaultRetryPolicy(),
 		MaxConsecutiveInvalid: 5,
+		Grace:                 grace,
 	})
 
 	// Poll metrics periodically during the run. The poller context is derived
@@ -150,48 +157,70 @@ func runMain(client *loadgen.Client, poller *loadgen.MetricsPoller,
 
 	start := time.Now()
 	stopReason := runner.Run(runCtx)
-	duration = time.Since(start)
+	measured := runner.Measured()
+	if measured <= 0 {
+		measured = time.Since(start)
+	}
 	pollCancel()
 	poller.Poll(context.Background())
 
 	granted, consumed, skipped := pacer.Counts()
-	sent, maskSuccess, restoreSuccess, restoreMismatch, maskNoChange := runner.Counts()
+	sent, maskSuccess, restoreSuccess, restoreMismatch, maskNoChange, canceled := runner.Counts()
 	sm, peakCPU, peakRSS := poller.Snapshot()
+	genRes := loadgen.SampleGeneratorResources()
 
 	rep := &loadgen.Report{
-		Title:            "Main load profile",
-		Mode:             mode,
-		Seed:             seed,
-		Duration:         duration,
-		TargetRPS:        target,
-		Granted:          granted,
-		Consumed:         consumed,
-		Skipped:          skipped,
-		Sent:             sent,
-		MaskSuccess:      maskSuccess,
-		RestoreSuccess:   restoreSuccess,
-		RestoreMismatch:  restoreMismatch,
-		MaskNoChange:     maskNoChange,
-		StopReason:       stopReason,
-		Stats:            runner.Stats(),
-		LatencyByClass:   runner.Stats().LatencyByClass(),
-		OpLatency:        runner.Stats().OpLatency(),
-		ActualRPS:        rps(sent, duration),
-		SuccessRPS:       rps(maskSuccess+restoreSuccess, duration),
-		OverloadFraction: fraction(runner.Stats().OutcomeCount(loadgen.OutcomeOverload), sent),
-		Pending:          scenario.Pending(),
-		StoreRecords:     sm.StoreRecords,
-		StoreBytes:       sm.StoreBytes,
-		CPUPercent:       peakCPU,
-		RSSBytes:         peakRSS,
-		ContainerLimits:  loadgen.ContainerLimits(containerName()),
-		SizeProfile:      fmt.Sprintf("small=%d medium=%d large=%d", small, medium, large),
-		OpFraction:       fmt.Sprintf("restore_fraction=%.2f", restoreFrac),
-		Preparation:      prepNote,
+		Title:              "Main load profile",
+		Mode:               mode,
+		Seed:               seed,
+		RunID:              runID,
+		Command:            command,
+		Duration:           measured,
+		Grace:              grace,
+		TargetRPS:          target,
+		PeakRPS:            peak,
+		Ramp:               ramp,
+		BurstEvery:         burstEvery,
+		BurstDuration:      burstDur,
+		Granted:            granted,
+		Consumed:           consumed,
+		Skipped:            skipped,
+		Overdue:            pacer.Overdue(),
+		Sent:               sent,
+		MaskSuccess:        maskSuccess,
+		RestoreSuccess:     restoreSuccess,
+		RestoreMismatch:    restoreMismatch,
+		MaskNoChange:       maskNoChange,
+		Canceled:           canceled,
+		StopReason:         stopReason,
+		Stats:              runner.Stats(),
+		LatencyByClass:     runner.Stats().LatencyByClass(),
+		OpLatency:          runner.Stats().OpLatency(),
+		ActualRPS:          rps(sent, measured),
+		SuccessRPS:         rps(maskSuccess+restoreSuccess, measured),
+		OverloadFraction:   fraction(runner.Stats().OutcomeCount(loadgen.OutcomeOverload), sent),
+		Pending:            scenario.Pending(),
+		StoreRecordsPending: sm.StoreRecordsPending,
+		StoreRecordsReplay:  sm.StoreRecordsReplay,
+		StoreBytesPending:   sm.StoreBytesPending,
+		StoreBytesReplay:    sm.StoreBytesReplay,
+		StoreFailures:       sm.StoreFailures,
+		StoreTTL:            sm.StoreTTL,
+		Active:              sm.Active,
+		MetricsOK:           sm.OK(),
+		CPUPercent:          peakCPU,
+		RSSBytes:            peakRSS,
+		GeneratorHeap:       genRes.HeapInUse,
+		StoreDynamics:       poller.StoreDynamics(),
+		ContainerLimits:     loadgen.ContainerLimits(containerName()),
+		SizeProfile:         fmt.Sprintf("small=%d medium=%d large=%d", small, medium, large),
+		OpFraction:          fmt.Sprintf("restore_fraction=%.2f restore_budget=%d restore_delay=%s", restoreFrac, restoreBudget, restoreDelay),
+		Preparation:         prepNote,
 		Notes: []string{
 			"Token estimate is runes/4 (no exact tokenizer); sizes are in bytes and chars.",
 			"Generator memory is separate from service memory; inputs are pre-generated.",
 			"Latency is measured until the full response body is read; TTFB is separate.",
+			"Run end and per-request timeout are classified separately; unfinished operations are counted as canceled.",
 		},
 	}
 
@@ -351,15 +380,17 @@ func measureServiceRSS(base string) int64 {
 
 // runScheduled runs the scheduled send mode.
 func runScheduled(ctx context.Context, client *loadgen.Client, poller *loadgen.MetricsPoller,
-	base, outDir string, seed int64, target float64, workers, queue, totalPairs int, restoreFrac float64, small, medium, large int) {
+	base, outDir string, seed int64, target float64, workers, queue, totalPairs int, restoreFrac float64, restoreBudget int, restoreDelay time.Duration, small, medium, large int, grace time.Duration, runID, command string) {
 
 	gen := loadgen.NewTextGenerator(seed, loadgen.DefaultSizeProfile(), small, medium, large)
 	scenario := loadgen.NewScenario(loadgen.ScenarioConfig{
 		Mode:            loadgen.ModeMaskDominant,
 		TotalPairs:      totalPairs,
 		RestoreFraction: restoreFrac,
+		RestoreBudget:   restoreBudget,
+		RestoreDelay:    restoreDelay,
 		Seed:            seed,
-		RunID:           newRunID(),
+		RunID:           runID,
 	}, gen)
 	sched := loadgen.NewScheduler(client, scenario, loadgen.SchedulerConfig{
 		Target:                target,
@@ -367,6 +398,7 @@ func runScheduled(ctx context.Context, client *loadgen.Client, poller *loadgen.M
 		Queue:                 queue,
 		Retry:                 loadgen.DefaultRetryPolicy(),
 		MaxConsecutiveInvalid: 5,
+		Grace:                 grace,
 	})
 
 	// The poller context is derived from the run context so it stops when the
@@ -390,47 +422,64 @@ func runScheduled(ctx context.Context, client *loadgen.Client, poller *loadgen.M
 
 	start := time.Now()
 	stopReason := sched.Run(runCtx)
-	duration := time.Since(start)
+	measured := sched.Measured()
+	if measured <= 0 {
+		measured = time.Since(start)
+	}
 	pollCancel()
 	poller.Poll(context.Background())
 
-	scheduled, sent, late, skipped, maskSuccess, restoreSuccess, restoreMismatch, maskNoChange := sched.Counts()
+	scheduled, sent, late, skipped, maskSuccess, restoreSuccess, restoreMismatch, maskNoChange, overdue, canceled := sched.Counts()
 	sm, peakCPU, peakRSS := poller.Snapshot()
+	genRes := loadgen.SampleGeneratorResources()
 
 	rep := &loadgen.Report{
-		Title:            "Scheduled send mode",
-		Mode:             loadgen.ModeMaskDominant,
-		Seed:             seed,
-		Duration:         duration,
-		TargetRPS:        target,
-		Granted:          scheduled,
-		Consumed:         sent,
-		Skipped:          skipped,
-		Late:             late,
-		Sent:             sent,
-		MaskSuccess:      maskSuccess,
-		RestoreSuccess:   restoreSuccess,
-		RestoreMismatch:  restoreMismatch,
-		MaskNoChange:     maskNoChange,
-		StopReason:       stopReason,
-		Stats:            sched.Stats(),
-		LatencyByClass:   sched.Stats().LatencyByClass(),
-		OpLatency:        sched.Stats().OpLatency(),
-		ActualRPS:        rps(sent, duration),
-		SuccessRPS:       rps(maskSuccess+restoreSuccess, duration),
-		OverloadFraction: fraction(sched.Stats().OutcomeCount(loadgen.OutcomeOverload), sent),
-		Pending:          scenario.Pending(),
-		StoreRecords:     sm.StoreRecords,
-		StoreBytes:       sm.StoreBytes,
-		CPUPercent:       peakCPU,
-		RSSBytes:         peakRSS,
-		ContainerLimits:  loadgen.ContainerLimits(containerName()),
-		SizeProfile:      fmt.Sprintf("small=%d medium=%d large=%d", small, medium, large),
-		OpFraction:       fmt.Sprintf("restore_fraction=%.2f", restoreFrac),
+		Title:               "Scheduled send mode",
+		Mode:                loadgen.ModeMaskDominant,
+		Seed:                seed,
+		RunID:               runID,
+		Command:             command,
+		Duration:            measured,
+		Grace:               grace,
+		TargetRPS:           target,
+		Granted:             scheduled,
+		Consumed:            sent,
+		Skipped:             skipped,
+		Overdue:             overdue,
+		Late:                late,
+		Sent:                sent,
+		MaskSuccess:         maskSuccess,
+		RestoreSuccess:      restoreSuccess,
+		RestoreMismatch:     restoreMismatch,
+		MaskNoChange:        maskNoChange,
+		Canceled:            canceled,
+		StopReason:          stopReason,
+		Stats:               sched.Stats(),
+		LatencyByClass:      sched.Stats().LatencyByClass(),
+		OpLatency:           sched.Stats().OpLatency(),
+		ActualRPS:           rps(sent, measured),
+		SuccessRPS:          rps(maskSuccess+restoreSuccess, measured),
+		OverloadFraction:    fraction(sched.Stats().OutcomeCount(loadgen.OutcomeOverload), sent),
+		Pending:             scenario.Pending(),
+		StoreRecordsPending: sm.StoreRecordsPending,
+		StoreRecordsReplay:  sm.StoreRecordsReplay,
+		StoreBytesPending:   sm.StoreBytesPending,
+		StoreBytesReplay:    sm.StoreBytesReplay,
+		StoreFailures:       sm.StoreFailures,
+		StoreTTL:            sm.StoreTTL,
+		Active:              sm.Active,
+		MetricsOK:           sm.OK(),
+		CPUPercent:          peakCPU,
+		RSSBytes:            peakRSS,
+		GeneratorHeap:       genRes.HeapInUse,
+		StoreDynamics:       poller.StoreDynamics(),
+		ContainerLimits:     loadgen.ContainerLimits(containerName()),
+		SizeProfile:         fmt.Sprintf("small=%d medium=%d large=%d", small, medium, large),
+		OpFraction:          fmt.Sprintf("restore_fraction=%.2f restore_budget=%d restore_delay=%s", restoreFrac, restoreBudget, restoreDelay),
 		Notes: []string{
 			"Scheduled mode: fixed rate, bounded queue, late sends and skips visible.",
-			"Late count is not tracked per-slot; skips are queue-full drops.",
-			"Retries are gated by the configured rate so the achieved send rate stays within the intensity.",
+			"Initial attempts and retries share one common HTTP budget.",
+			"Run end and per-request timeout are classified separately; unfinished operations are counted as canceled.",
 		},
 	}
 	writeReport(outDir, "scheduled.txt", rep)
@@ -457,7 +506,7 @@ func runCompat(ctx context.Context, client *loadgen.Client, base, outDir string,
 	start := time.Now()
 	stopReason := runner.Run(ctx)
 	duration := time.Since(start)
-	sent, maskSuccess, restoreSuccess, _, _ := runner.Counts()
+	sent, maskSuccess, restoreSuccess, _, _, _ := runner.Counts()
 	rep := &loadgen.Report{
 		Title:          "Compatibility check",
 		Mode:           loadgen.ModeSequential,
@@ -503,69 +552,112 @@ func writeJSON(outDir, name string, rep *loadgen.Report) {
 		P95  string `json:"p95"`
 		P99  string `json:"p99"`
 	}
+	type jsonSample struct {
+		At       string `json:"at"`
+		Records  int64  `json:"records"`
+		Bytes    int64  `json:"bytes"`
+		Mask     int64  `json:"mask"`
+		Restore  int64  `json:"restore"`
+		Overload int64  `json:"overload"`
+		Errors   int64  `json:"errors"`
+		OK       bool   `json:"ok"`
+	}
 	type jsonReport struct {
-		Title            string                                `json:"title"`
-		Mode             loadgen.Mode                          `json:"mode"`
-		Seed             int64                                 `json:"seed"`
-		Duration         string                                `json:"duration"`
-		TargetRPS        float64                               `json:"target_rps"`
-		Granted          int64                                 `json:"granted"`
-		Consumed         int64                                 `json:"consumed"`
-		Skipped          int64                                 `json:"skipped"`
-		Late             int64                                 `json:"late"`
-		Sent             int64                                 `json:"sent"`
-		MaskSuccess      int64                                 `json:"mask_success"`
-		RestoreSuccess   int64                                 `json:"restore_success"`
-		RestoreMismatch  int64                                 `json:"restore_mismatch"`
-		MaskNoChange     int64                                 `json:"mask_no_change"`
-		StopReason       string                                `json:"stop_reason"`
-		Pending          int                                   `json:"pending"`
-		StoreRecords     int64                                 `json:"store_records"`
-		StoreBytes       int64                                 `json:"store_bytes"`
-		CPUPercent       float64                               `json:"cpu_percent"`
-		RSSBytes         int64                                 `json:"rss_bytes"`
-		ContainerLimits  string                                `json:"container_limits"`
-		SizeProfile      string                                `json:"size_profile"`
-		OpFraction       string                                `json:"op_fraction"`
-		Preparation      string                                `json:"preparation"`
-		Notes            []string                              `json:"notes"`
-		Stats            *jsonStats                            `json:"stats"`
-		Latency          *jsonLatency                          `json:"latency"`
-		LatencyByClass   map[loadgen.LatencyClass]*jsonLatency `json:"latency_by_class"`
-		OpLatency        *jsonLatency                          `json:"op_latency"`
-		ActualRPS        float64                               `json:"actual_rps"`
-		SuccessRPS       float64                               `json:"success_rps"`
-		OverloadFraction float64                               `json:"overload_fraction"`
+		Title               string                                `json:"title"`
+		Mode                loadgen.Mode                          `json:"mode"`
+		Seed                int64                                 `json:"seed"`
+		RunID               string                                `json:"run_id"`
+		Command             string                                `json:"command"`
+		Duration            string                                `json:"duration"`
+		Grace               string                                `json:"grace"`
+		TargetRPS           float64                               `json:"target_rps"`
+		PeakRPS             float64                               `json:"peak_rps"`
+		Ramp                string                                `json:"ramp"`
+		BurstEvery          string                                `json:"burst_every"`
+		BurstDuration       string                                `json:"burst_duration"`
+		Granted             int64                                 `json:"granted"`
+		Consumed            int64                                 `json:"consumed"`
+		Skipped             int64                                 `json:"skipped"`
+		Overdue             int64                                 `json:"overdue"`
+		Late                int64                                 `json:"late"`
+		Sent                int64                                 `json:"sent"`
+		MaskSuccess         int64                                 `json:"mask_success"`
+		RestoreSuccess      int64                                 `json:"restore_success"`
+		RestoreMismatch     int64                                 `json:"restore_mismatch"`
+		MaskNoChange        int64                                 `json:"mask_no_change"`
+		Canceled            int64                                 `json:"canceled"`
+		StopReason          string                                `json:"stop_reason"`
+		Pending             int                                   `json:"pending"`
+		StoreRecordsPending int64                                 `json:"store_records_pending"`
+		StoreRecordsReplay  int64                                 `json:"store_records_replay"`
+		StoreBytesPending   int64                                 `json:"store_bytes_pending"`
+		StoreBytesReplay    int64                                 `json:"store_bytes_replay"`
+		StoreFailures       map[string]int64                      `json:"store_failures"`
+		StoreTTL            int64                                 `json:"store_ttl"`
+		Active              int64                                 `json:"active"`
+		MetricsOK           bool                                  `json:"metrics_ok"`
+		CPUPercent          float64                               `json:"cpu_percent"`
+		RSSBytes            int64                                 `json:"rss_bytes"`
+		GeneratorHeap       int64                                 `json:"generator_heap"`
+		ContainerLimits     string                                `json:"container_limits"`
+		SizeProfile         string                                `json:"size_profile"`
+		OpFraction          string                                `json:"op_fraction"`
+		Preparation         string                                `json:"preparation"`
+		Notes               []string                              `json:"notes"`
+		Stats               *jsonStats                            `json:"stats"`
+		Latency             *jsonLatency                          `json:"latency"`
+		LatencyByClass      map[loadgen.LatencyClass]*jsonLatency `json:"latency_by_class"`
+		OpLatency           *jsonLatency                          `json:"op_latency"`
+		ActualRPS           float64                               `json:"actual_rps"`
+		SuccessRPS          float64                               `json:"success_rps"`
+		OverloadFraction    float64                               `json:"overload_fraction"`
+		StoreDynamics       []jsonSample                          `json:"store_dynamics"`
 	}
 	jr := &jsonReport{
-		Title:            rep.Title,
-		Mode:             rep.Mode,
-		Seed:             rep.Seed,
-		Duration:         rep.Duration.String(),
-		TargetRPS:        rep.TargetRPS,
-		Granted:          rep.Granted,
-		Consumed:         rep.Consumed,
-		Skipped:          rep.Skipped,
-		Late:             rep.Late,
-		Sent:             rep.Sent,
-		MaskSuccess:      rep.MaskSuccess,
-		RestoreSuccess:   rep.RestoreSuccess,
-		RestoreMismatch:  rep.RestoreMismatch,
-		MaskNoChange:     rep.MaskNoChange,
-		StopReason:       rep.StopReason,
-		Pending:          rep.Pending,
-		StoreRecords:     rep.StoreRecords,
-		StoreBytes:       rep.StoreBytes,
-		CPUPercent:       rep.CPUPercent,
-		RSSBytes:         rep.RSSBytes,
-		ContainerLimits:  rep.ContainerLimits,
-		SizeProfile:      rep.SizeProfile,
-		OpFraction:       rep.OpFraction,
-		Preparation:      rep.Preparation,
-		Notes:            rep.Notes,
-		ActualRPS:        rep.ActualRPS,
-		SuccessRPS:       rep.SuccessRPS,
-		OverloadFraction: rep.OverloadFraction,
+		Title:               rep.Title,
+		Mode:                rep.Mode,
+		Seed:                rep.Seed,
+		RunID:               rep.RunID,
+		Command:             rep.Command,
+		Duration:            rep.Duration.String(),
+		Grace:               rep.Grace.String(),
+		TargetRPS:           rep.TargetRPS,
+		PeakRPS:             rep.PeakRPS,
+		Ramp:                rep.Ramp.String(),
+		BurstEvery:          rep.BurstEvery.String(),
+		BurstDuration:       rep.BurstDuration.String(),
+		Granted:             rep.Granted,
+		Consumed:            rep.Consumed,
+		Skipped:             rep.Skipped,
+		Overdue:             rep.Overdue,
+		Late:                rep.Late,
+		Sent:                rep.Sent,
+		MaskSuccess:         rep.MaskSuccess,
+		RestoreSuccess:      rep.RestoreSuccess,
+		RestoreMismatch:     rep.RestoreMismatch,
+		MaskNoChange:        rep.MaskNoChange,
+		Canceled:            rep.Canceled,
+		StopReason:          rep.StopReason,
+		Pending:             rep.Pending,
+		StoreRecordsPending: rep.StoreRecordsPending,
+		StoreRecordsReplay:  rep.StoreRecordsReplay,
+		StoreBytesPending:   rep.StoreBytesPending,
+		StoreBytesReplay:    rep.StoreBytesReplay,
+		StoreFailures:       rep.StoreFailures,
+		StoreTTL:            rep.StoreTTL,
+		Active:              rep.Active,
+		MetricsOK:           rep.MetricsOK,
+		CPUPercent:          rep.CPUPercent,
+		RSSBytes:            rep.RSSBytes,
+		GeneratorHeap:       rep.GeneratorHeap,
+		ContainerLimits:     rep.ContainerLimits,
+		SizeProfile:         rep.SizeProfile,
+		OpFraction:          rep.OpFraction,
+		Preparation:         rep.Preparation,
+		Notes:               rep.Notes,
+		ActualRPS:           rep.ActualRPS,
+		SuccessRPS:          rep.SuccessRPS,
+		OverloadFraction:    rep.OverloadFraction,
 	}
 	if rep.Stats != nil {
 		snap := rep.Stats.Snapshot()
@@ -601,6 +693,21 @@ func writeJSON(outDir, name string, rep *loadgen.Report) {
 			P50:  rep.OpLatency.P50.String(),
 			P95:  rep.OpLatency.P95.String(),
 			P99:  rep.OpLatency.P99.String(),
+		}
+	}
+	if len(rep.StoreDynamics) > 0 {
+		jr.StoreDynamics = make([]jsonSample, 0, len(rep.StoreDynamics))
+		for _, s := range rep.StoreDynamics {
+			jr.StoreDynamics = append(jr.StoreDynamics, jsonSample{
+				At:       s.At.Format(time.RFC3339),
+				Records:  s.Records,
+				Bytes:    s.Bytes,
+				Mask:     s.Mask,
+				Restore:  s.Restore,
+				Overload: s.Overload,
+				Errors:   s.Errors,
+				OK:       s.OK,
+			})
 		}
 	}
 	data, err := json.MarshalIndent(jr, "", "  ")
