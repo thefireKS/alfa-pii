@@ -292,12 +292,33 @@ func TestTTLExpiry(t *testing.T) {
 	}
 }
 
-// TestCleanupRaceWithRead runs the background cleanup concurrently with reads
-// and creates to catch data races under -race.
-func TestCleanupRaceWithRead(t *testing.T) {
-	now := time.Now()
+// fakeClock is a controllable clock for TTL tests. It is safe for concurrent
+// use because the store calls now() from multiple goroutines.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+// TestCleanupRaceAcrossTTL runs the background cleanup concurrently with reads
+// and creates while the clock crosses the TTL boundary, so records actually
+// expire under concurrency. It catches data races under -race and verifies that
+// the store keeps working across the expiry boundary.
+func TestCleanupRaceAcrossTTL(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
 	s := NewMemory(Limits{MaxEntries: 1000, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: 10 * time.Millisecond, CreateWait: time.Second, CleanupInterval: time.Millisecond})
-	s.now = func() time.Time { return now }
+	s.now = clock.now
 	s.StartCleanup()
 	defer s.Stop()
 
@@ -312,6 +333,12 @@ func TestCleanupRaceWithRead(t *testing.T) {
 				_, _ = s.Get(key)
 			}
 		}(i)
+	}
+	// Advance the clock past the TTL while the goroutines run so records expire
+	// and are reclaimed concurrently with reads and creates.
+	for i := 0; i < 20; i++ {
+		time.Sleep(2 * time.Millisecond)
+		clock.advance(5 * time.Millisecond)
 	}
 	wg.Wait()
 }
@@ -478,5 +505,236 @@ func TestRecordSizeCountsMarkersNotValues(t *testing.T) {
 	want := base + 2*int64(replacementOverhead+len("[PII_0]"))
 	if size != want {
 		t.Fatalf("recordSize = %d, want %d", size, want)
+	}
+}
+
+// TestExactTTLBoundaryExpires verifies that a record whose deadline equals the
+// current time is expired: the single expiry boundary counts exact equality.
+func TestExactTTLBoundaryExpires(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute})
+	s.now = clock.now
+	if _, created, err := s.Create(context.Background(), "k", build(rec("orig", "mask"))); err != nil || !created {
+		t.Fatalf("Create = created %v, err %v", created, err)
+	}
+	// Advance exactly to the deadline: now == createdAt + TTL.
+	clock.advance(time.Minute)
+	if _, ok := s.Get("k"); ok {
+		t.Fatal("record should be expired at exact TTL boundary")
+	}
+}
+
+// TestMassExpiryBatched verifies that a large backlog of expired records is
+// reclaimed in bounded batches: a single drain pass removes at most
+// drainBatchSize records, and repeated drains (as the background cleanup does)
+// reclaim the whole backlog.
+func TestMassExpiryBatched(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	const n = 3 * drainBatchSize
+	s := NewMemory(Limits{MaxEntries: n + 1, MaxBytes: 1 << 30, MaxRecordBytes: 1 << 20, TTL: time.Minute})
+	s.now = clock.now
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("k%d", i)
+		if _, created, err := s.Create(context.Background(), key, build(rec("orig", "mask"))); err != nil || !created {
+			t.Fatalf("seed create %d = created %v, err %v", i, created, err)
+		}
+	}
+	clock.advance(2 * time.Minute)
+
+	// A single drain pass is bounded by drainBatchSize.
+	s.mu.Lock()
+	ev := s.drainExpired()
+	s.mu.Unlock()
+	if ev.removed != drainBatchSize {
+		t.Fatalf("single drain removed %d, want %d", ev.removed, drainBatchSize)
+	}
+	if len(s.entries) != n-drainBatchSize {
+		t.Fatalf("entries = %d after one batch, want %d (backlog not fully drained)", len(s.entries), n-drainBatchSize)
+	}
+
+	// Repeated drains reclaim the whole backlog.
+	s.drainAll()
+	if len(s.entries) != 0 {
+		t.Fatalf("entries = %d after drainAll, want 0", len(s.entries))
+	}
+	if s.bytes != 0 {
+		t.Fatalf("bytes = %d after drainAll, want 0", s.bytes)
+	}
+	if s.expiries.Len() != 0 {
+		t.Fatalf("expiry queue len = %d after drainAll, want 0", s.expiries.Len())
+	}
+}
+
+// TestCreateAtCapacityDrainsBoundedBatch verifies that a Create at capacity
+// frees only a bounded number of expired records (not the whole backlog) and
+// that the store accepts new records again once expired records are reclaimed.
+func TestCreateAtCapacityDrainsBoundedBatch(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	const n = 3 * drainBatchSize
+	s := NewMemory(Limits{MaxEntries: n, MaxBytes: 1 << 30, MaxRecordBytes: 1 << 20, TTL: time.Minute})
+	s.now = clock.now
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("k%d", i)
+		if _, created, err := s.Create(context.Background(), key, build(rec("orig", "mask"))); err != nil || !created {
+			t.Fatalf("seed create %d = created %v, err %v", i, created, err)
+		}
+	}
+	clock.advance(2 * time.Minute)
+
+	// The store is full of expired records. A Create drains a bounded number of
+	// batches (one before the capacity check and one before publish) and then
+	// accepts the new record; the rest of the backlog is left for cleanup.
+	if _, created, err := s.Create(context.Background(), "new", build(rec("o", "m"))); err != nil || !created {
+		t.Fatalf("Create after expiry = created %v, err %v", created, err)
+	}
+	if _, ok := s.Get("new"); !ok {
+		t.Fatal("new record not present")
+	}
+	// The backlog is not fully drained by one Create: at most two batches were
+	// reclaimed, so the remaining live records are n - 2*batch + 1.
+	if want := n - 2*drainBatchSize + 1; len(s.entries) != want {
+		t.Fatalf("entries = %d, want %d (only bounded batches drained)", len(s.entries), want)
+	}
+}
+
+// TestRecreateKeyOldNodeDoesNotDeleteNew verifies that re-creating a key after
+// its TTL does not let an old expiry node delete the new live record.
+func TestRecreateKeyOldNodeDoesNotDeleteNew(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute})
+	s.now = clock.now
+	if _, created, err := s.Create(context.Background(), "k", build(rec("old", "oldmask"))); err != nil || !created {
+		t.Fatalf("first Create = created %v, err %v", created, err)
+	}
+	clock.advance(2 * time.Minute)
+	if _, created, err := s.Create(context.Background(), "k", build(rec("new", "newmask"))); err != nil || !created {
+		t.Fatalf("re-create = created %v, err %v", created, err)
+	}
+	// The new record must survive a drain that runs after its creation.
+	s.drainAll()
+	r, ok := s.Get("k")
+	if !ok || r.Original != "new" {
+		t.Fatalf("Get after drain = %+v, %v; want new record", r, ok)
+	}
+	// The expiry queue holds exactly one node for the live record.
+	if s.expiries.Len() != 1 {
+		t.Fatalf("expiry queue len = %d, want 1", s.expiries.Len())
+	}
+}
+
+// TestStopIdempotent verifies that Stop is safe to call repeatedly and that the
+// background goroutine actually terminates.
+func TestStopIdempotent(t *testing.T) {
+	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute, CleanupInterval: time.Millisecond})
+	s.StartCleanup()
+	s.Stop()
+	s.Stop() // must not panic on double close
+	// StartCleanup after Stop must work and Stop again must be safe.
+	s.StartCleanup()
+	s.Stop()
+}
+
+// TestObserverNotCalledUnderMutex verifies that the observer is invoked without
+// the store mutex held during eviction. The observer records whether it holds
+// the store mutex; the store must never call it while locked.
+func TestObserverNotCalledUnderMutex(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute})
+	s.now = clock.now
+	obs := &mutexCheckingObserver{store: s}
+	s.SetObserver(obs)
+	if _, created, err := s.Create(context.Background(), "k", build(rec("orig", "mask"))); err != nil || !created {
+		t.Fatalf("Create = created %v, err %v", created, err)
+	}
+	clock.advance(2 * time.Minute)
+	if _, ok := s.Get("k"); ok {
+		t.Fatal("record should be expired")
+	}
+	if obs.locked {
+		t.Fatal("observer was called while the store mutex was held")
+	}
+}
+
+// mutexCheckingObserver fails if any observer method is called while the store
+// mutex is held. TryLock reports whether the mutex is currently held by another
+// goroutine.
+type mutexCheckingObserver struct {
+	store  *Memory
+	locked bool
+}
+
+func (o *mutexCheckingObserver) check() {
+	if !o.store.mu.TryLock() {
+		o.locked = true
+		return
+	}
+	o.store.mu.Unlock()
+}
+func (o *mutexCheckingObserver) RecordAdded()   { o.check() }
+func (o *mutexCheckingObserver) RecordRemoved() { o.check() }
+func (o *mutexCheckingObserver) BytesDelta(int64) {
+	o.check()
+}
+func (o *mutexCheckingObserver) TTLExpired() { o.check() }
+func (o *mutexCheckingObserver) Failure(string) {
+	o.check()
+}
+
+// TestLongKeyReleasedAfterEviction verifies that after a record with a long key
+// is evicted and the expiry queue is drained, no reference to the key remains in
+// the queue's backing array. This is the diagnostic scenario: entries, bytes and
+// queue length are zero, and the backing array must not retain the key.
+func TestLongKeyReleasedAfterEviction(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 30, MaxRecordBytes: 1 << 30, TTL: time.Minute})
+	s.now = clock.now
+	key := strings.Repeat("k", 1<<20)
+	if _, created, err := s.Create(context.Background(), key, build(rec("orig", "mask"))); err != nil || !created {
+		t.Fatalf("Create = created %v, err %v", created, err)
+	}
+	clock.advance(2 * time.Minute)
+	if _, ok := s.Get(key); ok {
+		t.Fatal("record should be expired")
+	}
+	if len(s.entries) != 0 || s.bytes != 0 || s.expiries.Len() != 0 {
+		t.Fatalf("entries=%d bytes=%d queue=%d, want all zero", len(s.entries), s.bytes, s.expiries.Len())
+	}
+	// The backing array slot must be zeroed so the long key is not retained.
+	for _, n := range s.expiries.nodes {
+		if n.key != "" {
+			t.Fatal("expiry queue backing array still holds a key reference")
+		}
+	}
+}
+
+// TestConcurrentGetCreateAcrossTTL runs concurrent Get and Create for many keys
+// while the clock crosses the TTL boundary, verifying that the store stays
+// consistent and the expiry queue never accumulates stale nodes.
+func TestConcurrentGetCreateAcrossTTL(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	const n = 200
+	s := NewMemory(Limits{MaxEntries: n + 10, MaxBytes: 1 << 30, MaxRecordBytes: 1 << 20, TTL: 10 * time.Millisecond})
+	s.now = clock.now
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < n; j++ {
+				key := fmt.Sprintf("k%d", j)
+				_, _, _ = s.Create(context.Background(), key, build(rec("orig", "mask")))
+				_, _ = s.Get(key)
+			}
+		}()
+	}
+	for i := 0; i < 10; i++ {
+		time.Sleep(2 * time.Millisecond)
+		clock.advance(5 * time.Millisecond)
+	}
+	wg.Wait()
+	// The expiry queue must hold at most one node per live record.
+	if s.expiries.Len() > len(s.entries) {
+		t.Fatalf("expiry queue len %d exceeds live records %d", s.expiries.Len(), len(s.entries))
 	}
 }

@@ -40,6 +40,11 @@ type Record struct {
 	Format string
 	// CreatedAt is the wall-clock time the record was created.
 	CreatedAt time.Time
+	// size is the estimated memory footprint of the record, computed once at
+	// publish time and reused at eviction so the replacement table is not
+	// re-walked under the store mutex. It is unexported because it is an
+	// internal accounting detail, not part of the stored correspondence.
+	size int64
 }
 
 // Replacement maps a marker to the byte range [Start, End) of the original
@@ -103,28 +108,60 @@ type inflight struct {
 	err  error
 }
 
-// expiryEntry is one element of the min-heap that orders records by their
-// expiration time. The heap lets the store find expired records without walking
-// the whole map on every access: the top of the heap is the next record to
-// expire, so eviction is bounded by the number of actually expired records.
-type expiryEntry struct {
+// expiryNode is one element of the expiry queue.
+type expiryNode struct {
 	expiresAt time.Time
 	key       string
 }
 
-// expiryHeap is a min-heap ordered by expiresAt.
-type expiryHeap []expiryEntry
+// expiryQueue is a min-heap of expiry nodes ordered by expiresAt, with an index
+// map so a node can be removed in O(log n) when its record is deleted or
+// re-created. Each live record has exactly one node in the queue: removing a
+// record removes its node, so the queue never accumulates stale key references
+// and its memory is bounded by the number of live records. Pop zeroes the
+// removed backing-array slot so a long key is not retained after eviction.
+type expiryQueue struct {
+	nodes []expiryNode
+	index map[string]int
+}
 
-func (h expiryHeap) Len() int           { return len(h) }
-func (h expiryHeap) Less(i, j int) bool { return h[i].expiresAt.Before(h[j].expiresAt) }
-func (h expiryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *expiryHeap) Push(x any)        { *h = append(*h, x.(expiryEntry)) }
-func (h *expiryHeap) Pop() any {
-	old := *h
+func newExpiryQueue() *expiryQueue {
+	return &expiryQueue{index: make(map[string]int)}
+}
+
+func (q *expiryQueue) Len() int { return len(q.nodes) }
+func (q *expiryQueue) Less(i, j int) bool {
+	return q.nodes[i].expiresAt.Before(q.nodes[j].expiresAt)
+}
+func (q *expiryQueue) Swap(i, j int) {
+	q.nodes[i], q.nodes[j] = q.nodes[j], q.nodes[i]
+	q.index[q.nodes[i].key] = i
+	q.index[q.nodes[j].key] = j
+}
+func (q *expiryQueue) Push(x any) {
+	n := x.(expiryNode)
+	q.index[n.key] = len(q.nodes)
+	q.nodes = append(q.nodes, n)
+}
+func (q *expiryQueue) Pop() any {
+	old := q.nodes
 	n := len(old)
 	item := old[n-1]
-	*h = old[:n-1]
+	old[n-1] = expiryNode{} // release the key reference from the backing array
+	q.nodes = old[:n-1]
+	delete(q.index, item.key)
 	return item
+}
+
+// remove deletes the node for key from the queue, if present. It is used when a
+// record is evicted or re-created so the queue holds exactly one node per live
+// record.
+func (q *expiryQueue) remove(key string) {
+	i, ok := q.index[key]
+	if !ok {
+		return
+	}
+	heap.Remove(q, i)
 }
 
 // Observer receives store lifecycle events for observability. It is optional;
@@ -154,7 +191,7 @@ type Memory struct {
 	limits   Limits
 	now      func() time.Time
 	inflight map[string]*inflight
-	expiries expiryHeap
+	expiries *expiryQueue
 	obs      Observer
 
 	stopCh  chan struct{}
@@ -169,7 +206,7 @@ func NewMemory(limits Limits) *Memory {
 		limits:   limits,
 		now:      time.Now,
 		inflight: make(map[string]*inflight),
-		expiries: make(expiryHeap, 0),
+		expiries: newExpiryQueue(),
 	}
 }
 
@@ -183,30 +220,37 @@ func (s *Memory) SetObserver(o Observer) {
 
 // Get implements Store. It checks the TTL of only the requested key, so the
 // cost of a read does not grow with the number of stored records. An expired
-// record for the requested key is removed eagerly (O(1)); other expired records
-// are reclaimed by the background cleanup or by a capacity drain.
+// record for the requested key is removed eagerly (O(log n)); other expired
+// records are reclaimed by the background cleanup or by a capacity drain.
 func (s *Memory) Get(key string) (Record, bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	rec, ok := s.entries[key]
 	if !ok {
+		s.mu.Unlock()
 		return Record{}, false
 	}
 	if s.isExpired(rec) {
-		size := recordSize(key, rec)
-		delete(s.entries, key)
-		s.bytes -= size
-		s.reportRemoved(size)
-		s.reportTTLExpired()
+		ev := s.evictLocked(key, rec)
+		s.mu.Unlock()
+		s.flushEvents(ev)
 		return Record{}, false
 	}
+	s.mu.Unlock()
 	return rec, true
 }
 
 // isExpired reports whether rec has outlived the store TTL. It must be called
 // with the mutex held.
 func (s *Memory) isExpired(rec Record) bool {
-	return s.limits.TTL > 0 && rec.CreatedAt.Before(s.now().Add(-s.limits.TTL))
+	return isExpiredAt(rec.CreatedAt, s.now(), s.limits.TTL)
+}
+
+// isExpiredAt reports whether a record created at createdAt is expired at now
+// under the given TTL. A record is expired when now >= createdAt + TTL, so exact
+// equality of the deadline counts as expired. This is the single expiry boundary
+// used by both lazy eviction and the expiry queue.
+func isExpiredAt(createdAt, now time.Time, ttl time.Duration) bool {
+	return ttl > 0 && !createdAt.After(now.Add(-ttl))
 }
 
 // Create implements Store. It is atomic for a single key: concurrent calls for
@@ -222,18 +266,17 @@ func (s *Memory) Create(ctx context.Context, key string, build func(context.Cont
 		if rec, ok := s.entries[key]; ok {
 			if s.isExpired(rec) {
 				// The record outlived its TTL: treat the key as absent and
-				// remove it so a new correspondence can be created. The heap
-				// entry for the old record becomes stale and is skipped on the
-				// next drain.
-				size := recordSize(key, rec)
-				delete(s.entries, key)
-				s.bytes -= size
-				s.reportRemoved(size)
-				s.reportTTLExpired()
-			} else {
+				// remove it so a new correspondence can be created. Its expiry
+				// node is removed too, so the queue keeps one node per live
+				// record. Restart the loop to re-acquire the lock and become
+				// the creator.
+				ev := s.evictLocked(key, rec)
 				s.mu.Unlock()
-				return rec, false, nil
+				s.flushEvents(ev)
+				continue
 			}
+			s.mu.Unlock()
+			return rec, false, nil
 		}
 		if inf, ok := s.inflight[key]; ok {
 			s.mu.Unlock()
@@ -255,18 +298,21 @@ func (s *Memory) Create(ctx context.Context, key string, build func(context.Cont
 
 		// Reject before running build when the store is already at capacity, so
 		// an expensive recognition is not paid for a request that cannot be
-		// stored. Expired records are drained first so a full store that only
-		// holds expired correspondences can accept new ones. The per-record
+		// stored. A bounded batch of expired records is drained first so a full
+		// store that only holds expired correspondences can accept new ones; the
+		// drain never walks the whole backlog under the mutex. The per-record
 		// size is still checked after build.
 		s.mu.Lock()
-		s.drainExpired()
+		ev := s.drainExpired()
 		if len(s.entries) >= s.limits.MaxEntries || s.bytes >= s.limits.MaxBytes {
 			s.mu.Unlock()
+			s.flushEvents(ev)
 			s.finishInflight(key, inf, Record{}, ErrCapacity)
 			s.reportFailure(StoreFailCapacity)
 			return Record{}, false, ErrCapacity
 		}
 		s.mu.Unlock()
+		s.flushEvents(ev)
 
 		rec, err := build(ctx)
 		if err != nil {
@@ -279,11 +325,13 @@ func (s *Memory) Create(ctx context.Context, key string, build func(context.Cont
 		}
 
 		s.mu.Lock()
-		s.drainExpired()
+		ev = s.drainExpired()
 		rec.CreatedAt = s.now()
-		size := recordSize(key, rec)
+		rec.size = recordSize(key, rec)
+		size := rec.size
 		if size > s.limits.MaxRecordBytes || s.bytes+size > s.limits.MaxBytes || len(s.entries) >= s.limits.MaxEntries {
 			s.mu.Unlock()
+			s.flushEvents(ev)
 			s.finishInflight(key, inf, Record{}, ErrCapacity)
 			s.reportFailure(StoreFailCapacity)
 			return Record{}, false, ErrCapacity
@@ -291,9 +339,10 @@ func (s *Memory) Create(ctx context.Context, key string, build func(context.Cont
 		s.entries[key] = rec
 		s.bytes += size
 		if s.limits.TTL > 0 {
-			heap.Push(&s.expiries, expiryEntry{expiresAt: rec.CreatedAt.Add(s.limits.TTL), key: key})
+			heap.Push(s.expiries, expiryNode{expiresAt: rec.CreatedAt.Add(s.limits.TTL), key: key})
 		}
 		s.mu.Unlock()
+		s.flushEvents(ev)
 		s.finishInflight(key, inf, rec, nil)
 		s.reportAdded(size)
 		return rec, true, nil
@@ -352,21 +401,26 @@ func (s *Memory) StartCleanup() {
 }
 
 // Stop stops the background cleanup goroutine and waits for it to finish. It is
-// safe to call when cleanup was never started.
+// safe to call when cleanup was never started and safe to call repeatedly: only
+// the first call stops the goroutine, and every caller that actually stops it
+// waits for completion. The done channel is captured under the lock so a
+// concurrent StartCleanup cannot make Stop wait on a newer goroutine.
 func (s *Memory) Stop() {
 	s.mu.Lock()
 	if !s.started {
 		s.mu.Unlock()
 		return
 	}
+	s.started = false
 	close(s.stopCh)
+	done := s.doneCh
 	s.mu.Unlock()
-	<-s.doneCh
+	<-done
 }
 
-// cleanupLoop periodically evicts expired records until Stop is called. The
-// eviction is bounded by the number of actually expired records because it
-// drains the expiry heap instead of walking the whole map.
+// cleanupLoop periodically evicts expired records until Stop is called. Each
+// tick drains the expiry queue in bounded batches, releasing the mutex between
+// batches so concurrent operations are not starved by a large backlog.
 func (s *Memory) cleanupLoop() {
 	defer close(s.doneCh)
 	ticker := time.NewTicker(s.limits.CleanupInterval)
@@ -376,44 +430,103 @@ func (s *Memory) cleanupLoop() {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
-			s.mu.Lock()
-			s.drainExpired()
-			s.mu.Unlock()
+			s.drainAll()
 		}
 	}
 }
 
-// drainExpired removes records whose TTL has elapsed, in expiry order. It pops
-// the expiry heap while its top is expired and deletes the matching live
-// record. Heap entries whose record was already removed or re-created are
-// skipped, so the drain is bounded by the number of expired records and never
-// walks the whole map. It must be called with the mutex held.
-func (s *Memory) drainExpired() {
+// drainAll repeatedly drains bounded batches of expired records until none
+// remain, releasing the mutex and flushing observer events between batches. It
+// is used by the background cleanup so a large backlog is reclaimed without
+// holding the store mutex for the whole pass.
+func (s *Memory) drainAll() {
+	for {
+		s.mu.Lock()
+		ev := s.drainExpired()
+		s.mu.Unlock()
+		s.flushEvents(ev)
+		if ev.removed == 0 {
+			return
+		}
+	}
+}
+
+// drainBatchSize bounds the number of expired records removed in one pass under
+// the store mutex. A single Create or cleanup tick reclaims at most this many
+// records, so a large accumulated backlog is processed in batches and the lock
+// is released between them.
+const drainBatchSize = 1000
+
+// drainExpired removes up to drainBatchSize expired records in expiry order and
+// returns the observer events to flush. It must be called with the mutex held.
+// The batch bound keeps a single pass under the mutex short so concurrent
+// operations are not starved; the background cleanup repeats the drain until no
+// expired records remain.
+func (s *Memory) drainExpired() pendingEvents {
+	var ev pendingEvents
 	if s.limits.TTL <= 0 {
-		return
+		return ev
 	}
 	now := s.now()
 	cutoff := now.Add(-s.limits.TTL)
-	for s.expiries.Len() > 0 {
-		top := s.expiries[0]
-		if !top.expiresAt.Before(now) {
+	for i := 0; i < drainBatchSize && s.expiries.Len() > 0; i++ {
+		top := s.expiries.nodes[0]
+		if top.expiresAt.After(now) {
 			break
 		}
-		heap.Pop(&s.expiries)
+		heap.Pop(s.expiries)
 		rec, ok := s.entries[top.key]
 		if !ok {
 			continue
 		}
-		// A stale heap entry for a re-created key points at a record that is
-		// still live; leave it for its own (later) expiry entry.
-		if !rec.CreatedAt.Before(cutoff) {
+		// A stale node for a re-created key points at a record that is still
+		// live; leave it for its own (later) expiry node. With the indexed
+		// queue this should not occur, but the check keeps eviction safe.
+		if rec.CreatedAt.After(cutoff) {
 			continue
 		}
-		size := recordSize(top.key, rec)
+		ev.removed++
+		ev.ttl++
+		ev.bytes -= rec.size
 		delete(s.entries, top.key)
-		s.bytes -= size
-		s.reportRemoved(size)
-		s.reportTTLExpired()
+		s.bytes -= rec.size
+	}
+	return ev
+}
+
+// evictLocked removes a record and its expiry node from the store and returns
+// the observer events to flush. It must be called with the mutex held.
+func (s *Memory) evictLocked(key string, rec Record) pendingEvents {
+	delete(s.entries, key)
+	s.bytes -= rec.size
+	s.expiries.remove(key)
+	return pendingEvents{removed: 1, ttl: 1, bytes: -rec.size}
+}
+
+// pendingEvents accumulates observer notifications to be flushed after the
+// store mutex is released, so the observer is never called under the lock. The
+// counts and byte delta are bounded (no per-event queue), so concurrent adds and
+// removals keep the final counters accurate without an unbounded event buffer.
+type pendingEvents struct {
+	removed int
+	ttl     int
+	bytes   int64
+}
+
+// flushEvents delivers accumulated observer notifications. It must be called
+// without the mutex held.
+func (s *Memory) flushEvents(ev pendingEvents) {
+	if s.obs == nil {
+		return
+	}
+	for i := 0; i < ev.removed; i++ {
+		s.obs.RecordRemoved()
+	}
+	for i := 0; i < ev.ttl; i++ {
+		s.obs.TTLExpired()
+	}
+	if ev.bytes != 0 {
+		s.obs.BytesDelta(ev.bytes)
 	}
 }
 
@@ -425,25 +538,6 @@ func (s *Memory) reportAdded(size int64) {
 	}
 	s.obs.RecordAdded()
 	s.obs.BytesDelta(size)
-}
-
-// reportRemoved notifies the observer that a record was evicted. It must be
-// called without the mutex held.
-func (s *Memory) reportRemoved(size int64) {
-	if s.obs == nil {
-		return
-	}
-	s.obs.RecordRemoved()
-	s.obs.BytesDelta(-size)
-}
-
-// reportTTLExpired notifies the observer of a TTL eviction. It must be called
-// without the mutex held.
-func (s *Memory) reportTTLExpired() {
-	if s.obs == nil {
-		return
-	}
-	s.obs.TTLExpired()
 }
 
 // reportFailure notifies the observer of a storage failure. It must be called

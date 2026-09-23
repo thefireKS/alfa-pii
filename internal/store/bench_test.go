@@ -33,3 +33,40 @@ func BenchmarkGetLiveRecords(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkGetCreateDuringCleanup measures the latency of Get and Create while
+// the store reclaims a large backlog of expired records. It is a diagnostic
+// benchmark: it reports the observed read/create latency during cleanup for a
+// given sample size and environment, and is not a claim about end-to-end HTTP
+// RPS. The backlog is drained in bounded batches, so a single operation should
+// not wait for the whole pass.
+func BenchmarkGetCreateDuringCleanup(b *testing.B) {
+	for _, n := range []int{10_000, 50_000} {
+		b.Run(fmt.Sprintf("backlog=%d", n), func(b *testing.B) {
+			clock := &fakeClock{t: time.Now()}
+			s := NewMemory(Limits{MaxEntries: n + 1, MaxBytes: 1 << 30, MaxRecordBytes: 1 << 20, TTL: time.Minute})
+			s.now = clock.now
+			for i := 0; i < n; i++ {
+				key := fmt.Sprintf("key-%d", i)
+				if _, created, err := s.Create(context.Background(), key, build(rec("original", "masked"))); err != nil || !created {
+					b.Fatalf("seed create %d: created %v err %v", i, created, err)
+				}
+			}
+			// Expire the whole backlog so the next operation triggers a drain.
+			clock.advance(2 * time.Minute)
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				key := fmt.Sprintf("live-%d", i)
+				start := time.Now()
+				_, _, _ = s.Create(context.Background(), key, build(rec("original", "masked")))
+				createLatency := time.Since(start)
+				start = time.Now()
+				_, _ = s.Get(key)
+				getLatency := time.Since(start)
+				b.ReportMetric(float64(createLatency.Nanoseconds()), "create_ns/op")
+				b.ReportMetric(float64(getLatency.Nanoseconds()), "get_ns/op")
+			}
+		})
+	}
+}
