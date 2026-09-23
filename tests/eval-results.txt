@@ -1,57 +1,59 @@
 === PII recognition evaluation (synthetic dataset) ===
 Offset unit: bytes (UTF-8). Character metrics count bytes.
 Seed: 20260922
-Dev examples: 95, held-out examples: 37
+Dev examples: 106, held-out examples: 48
+Note: metrics are computed locally with the formulas in internal/eval;
+the organizers' scoring formula is unknown and may differ.
 
 --- DEV SET ---
-Ranges: expected=75 actual=75 TP=75 FN=0 FP=0
-Bytes: sensitive=1318 covered=1318 wrongCat=0 overMasked=0 total=3551
+Ranges: expected=86 actual=86 TP=86 FN=0 FP=0
+Bytes: sensitive=1604 covered=1604 wrongCat=0 overMasked=0 total=4155
 Restoration failures: 0, unchanged-text failures: 0
 Examples with errors: 0, total errors: 0
-Negative examples: 32, negative with errors: 0
+Negative examples: 33, negative with errors: 0
 
 category                  exp    act     TP     FN     FP   prec    rec   cov%   over
-address                     4      4      4      0      0   1.00   1.00  100.0      0
-birth_date                  4      4      4      0      0   1.00   1.00  100.0      0
-birth_place                 4      4      4      0      0   1.00   1.00  100.0      0
-card                        7      7      7      0      0   1.00   1.00  100.0      0
+address                     5      5      5      0      0   1.00   1.00  100.0      0
+birth_date                  5      5      5      0      0   1.00   1.00  100.0      0
+birth_place                 5      5      5      0      0   1.00   1.00  100.0      0
+card                        8      8      8      0      0   1.00   1.00  100.0      0
 card_holder_name            4      4      4      0      0   1.00   1.00  100.0      0
 citizenship                 4      4      4      0      0   1.00   1.00  100.0      0
-cvv                         4      4      4      0      0   1.00   1.00  100.0      0
+cvv                         5      5      5      0      0   1.00   1.00  100.0      0
 department_code             3      3      3      0      0   1.00   1.00  100.0      0
 driver_license              2      2      2      0      0   1.00   1.00  100.0      0
 email                       5      5      5      0      0   1.00   1.00  100.0      0
-full_name                   7      7      7      0      0   1.00   1.00  100.0      0
+full_name                  11     11     11      0      0   1.00   1.00  100.0      0
 inn                         6      6      6      0      0   1.00   1.00  100.0      0
-passport                    5      5      5      0      0   1.00   1.00  100.0      0
+passport                    6      6      6      0      0   1.00   1.00  100.0      0
 passport_authority          3      3      3      0      0   1.00   1.00  100.0      0
-passport_issue_date         3      3      3      0      0   1.00   1.00  100.0      0
+passport_issue_date         4      4      4      0      0   1.00   1.00  100.0      0
 phone                       6      6      6      0      0   1.00   1.00  100.0      0
 pin                         4      4      4      0      0   1.00   1.00  100.0      0
 
 --- HELD-OUT SET ---
-Ranges: expected=34 actual=34 TP=34 FN=0 FP=0
-Bytes: sensitive=705 covered=705 wrongCat=0 overMasked=0 total=1687
+Ranges: expected=45 actual=45 TP=45 FN=0 FP=0
+Bytes: sensitive=994 covered=994 wrongCat=0 overMasked=0 total=2284
 Restoration failures: 0, unchanged-text failures: 0
 Examples with errors: 0, total errors: 0
-Negative examples: 5, negative with errors: 0
+Negative examples: 6, negative with errors: 0
 
 category                  exp    act     TP     FN     FP   prec    rec   cov%   over
-address                     2      2      2      0      0   1.00   1.00  100.0      0
-birth_date                  3      3      3      0      0   1.00   1.00  100.0      0
-birth_place                 4      4      4      0      0   1.00   1.00  100.0      0
-card                        1      1      1      0      0   1.00   1.00  100.0      0
+address                     3      3      3      0      0   1.00   1.00  100.0      0
+birth_date                  4      4      4      0      0   1.00   1.00  100.0      0
+birth_place                 5      5      5      0      0   1.00   1.00  100.0      0
+card                        2      2      2      0      0   1.00   1.00  100.0      0
 card_holder_name            2      2      2      0      0   1.00   1.00  100.0      0
 citizenship                 4      4      4      0      0   1.00   1.00  100.0      0
-cvv                         2      2      2      0      0   1.00   1.00  100.0      0
+cvv                         3      3      3      0      0   1.00   1.00  100.0      0
 department_code             1      1      1      0      0   1.00   1.00  100.0      0
 driver_license              1      1      1      0      0   1.00   1.00  100.0      0
 email                       1      1      1      0      0   1.00   1.00  100.0      0
-full_name                   4      4      4      0      0   1.00   1.00  100.0      0
+full_name                   8      8      8      0      0   1.00   1.00  100.0      0
 inn                         2      2      2      0      0   1.00   1.00  100.0      0
-passport                    1      1      1      0      0   1.00   1.00  100.0      0
+passport                    2      2      2      0      0   1.00   1.00  100.0      0
 passport_authority          1      1      1      0      0   1.00   1.00  100.0      0
-passport_issue_date         2      2      2      0      0   1.00   1.00  100.0      0
+passport_issue_date         3      3      3      0      0   1.00   1.00  100.0      0
 phone                       2      2      2      0      0   1.00   1.00  100.0      0
 pin                         1      1      1      0      0   1.00   1.00  100.0      0
 

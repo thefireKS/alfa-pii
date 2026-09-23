@@ -107,6 +107,7 @@ internal/recognizer/recognizers_test.go
 internal/recognizer/registry.go
 internal/recognizer/registry_test.go
 internal/recognizer/regression_test.go
+internal/recognizer/regression2_test.go
 internal/recognizer/resolve_test.go
 internal/recognizer/scan.go
 internal/store/observer_test.go

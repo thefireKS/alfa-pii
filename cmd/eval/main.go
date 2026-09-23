@@ -62,6 +62,8 @@ func main() {
 	write("Offset unit: bytes (UTF-8). Character metrics count bytes.")
 	write("Seed: %d", eval.Seed())
 	write("Dev examples: %d, held-out examples: %d", len(dev), len(held))
+	write("Note: metrics are computed locally with the formulas in internal/eval;")
+	write("the organizers' scoring formula is unknown and may differ.")
 	write("")
 	writeReport(&b, "DEV SET", devReport)
 	writeReport(&b, "HELD-OUT SET", heldReport)

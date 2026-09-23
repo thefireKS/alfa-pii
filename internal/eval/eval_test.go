@@ -237,12 +237,12 @@ func TestUnchangedOutsideMasks(t *testing.T) {
 	}
 }
 
-// TestPoetReferenceLimitation documents a known limitation: a reference to a
-// person followed by a client label such as "родился" is masked as a full
-// name, because the context window treats the label as a client signal. This
-// is a deliberate trade-off of the context-window approach; the clean
-// reference "поэт Александр Пушкин" (no label) is not masked.
-func TestPoetReferenceLimitation(t *testing.T) {
+// TestPoetReferenceNotMasked guards the fix that a reference mention of a
+// person (for example a poet) is not masked as the client's full name, even
+// when a client label appears elsewhere in the sentence. The reference role
+// marker "поэт" suppresses masking; a client who genuinely bears the name is
+// still masked when the client label introduces it directly.
+func TestPoetReferenceNotMasked(t *testing.T) {
 	p := testPipeline()
 	// Clean reference without a client label is not masked.
 	clean := Example{Name: "clean", Text: "поэт Александр Пушкин", Expected: nil}
@@ -250,10 +250,20 @@ func TestPoetReferenceLimitation(t *testing.T) {
 	if len(cleanRes[0].Errors) != 0 {
 		t.Fatalf("clean reference should not be masked: %v", cleanRes[0].Errors)
 	}
-	// Reference followed by "родился" is masked (known limitation).
-	labeled := Example{Name: "labeled", Text: "поэт Александр Пушкин родился в 1799 году", Expected: nil}
+	// Reference mention with a client label elsewhere in the sentence is not
+	// masked either: the name is introduced by the reference marker "поэта".
+	labeled := Example{Name: "labeled", Text: "Клиент прочитал стихи поэта Александр Пушкин", Expected: nil}
 	labeledRes, _ := p.Evaluate([]Example{labeled})
-	if len(labeledRes[0].Errors) == 0 {
-		t.Fatal("expected the labeled reference to be masked (documented limitation)")
+	if len(labeledRes[0].Errors) != 0 {
+		t.Fatalf("reference mention should not be masked: %v", labeledRes[0].Errors)
+	}
+	// A client who genuinely bears the name is masked when the client label
+	// introduces it directly.
+	client := Example{Name: "client", Text: "Клиент Александр Пушкин", Expected: []Range{
+		{Start: len("Клиент "), End: len("Клиент Александр Пушкин"), Type: recognizer.FullName},
+	}}
+	clientRes, _ := p.Evaluate([]Example{client})
+	if len(clientRes[0].Errors) != 0 {
+		t.Fatalf("client's own name should be masked: %v", clientRes[0].Errors)
 	}
 }

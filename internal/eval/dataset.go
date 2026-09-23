@@ -83,6 +83,8 @@ func devSet() []Example {
 			want{"4111111111111112", recognizer.Card}),
 		ex("card_negative_invalid_bare", "4111111111111112", nil...),
 		ex("card_negative_order", "заказ 4111111111111111", nil...),
+		ex("card_after_amount_field", "Сумма: 100 рублей; карта: 4111 1111 1111 1111",
+			want{"4111 1111 1111 1111", recognizer.Card}),
 
 		// --- Passport ---
 		ex("passport_spaced", "паспорт 4506 123456",
@@ -93,6 +95,9 @@ func devSet() []Example {
 			want{"4506123456", recognizer.Passport}),
 		ex("passport_negative_bare", "4506123456", nil...),
 		ex("passport_negative_order", "заказ 4506123456", nil...),
+		ex("passport_after_date_field", "Дата выдачи: 01.01.2020; паспорт 4510 123456",
+			want{"01.01.2020", recognizer.PassportIssueDate},
+			want{"4510 123456", recognizer.Passport}),
 
 		// --- Department code ---
 		ex("department_signed", "код подразделения 770-123",
@@ -121,6 +126,8 @@ func devSet() []Example {
 		ex("cvv_russian", "код безопасности 456",
 			want{"456", recognizer.CVV}),
 		ex("cvv_negative_bare", "123", nil...),
+		ex("cvv_after_date_field", "Дата: 01.01.2020; CVV: 123",
+			want{"123", recognizer.CVV}),
 
 		// --- Full name ---
 		ex("fullname_labeled", "ФИО: Иванов Иван Иванович",
@@ -133,8 +140,17 @@ func devSet() []Example {
 			want{"И. И. Иванов", recognizer.FullName}),
 		ex("fullname_surname_field", "фамилия: Иванов",
 			want{"Иванов", recognizer.FullName}),
+		ex("fullname_uppercase", "ФИО: ИВАНОВ ИВАН ИВАНОВИЧ",
+			want{"ИВАНОВ ИВАН ИВАНОВИЧ", recognizer.FullName}),
+		ex("fullname_lowercase", "ФИО: иванов иван иванович",
+			want{"иванов иван иванович", recognizer.FullName}),
+		ex("fullname_given_name_field", "Имя: Анна",
+			want{"Анна", recognizer.FullName}),
+		ex("fullname_client_own_name", "Клиент Александр Пушкин",
+			want{"Александр Пушкин", recognizer.FullName}),
 		ex("fullname_negative_poet", "поэт Александр Пушкин", nil...),
 		ex("fullname_negative_bare", "Александр Пушкин", nil...),
+		ex("fullname_negative_poet_reference", "Клиент прочитал стихи поэта Александр Пушкин", nil...),
 
 		// --- Birth date ---
 		ex("birthdate_numeric", "дата рождения: 12.03.1990",
@@ -143,6 +159,8 @@ func devSet() []Example {
 			want{"12 марта 1990 года", recognizer.BirthDate}),
 		ex("birthdate_born", "родился 12.03.1990",
 			want{"12.03.1990", recognizer.BirthDate}),
+		ex("birthdate_uppercase_month", "Дата рождения: 12 МАРТА 1990 года",
+			want{"12 МАРТА 1990 года", recognizer.BirthDate}),
 		ex("birthdate_negative_bare", "12.03.1990", nil...),
 
 		// --- Birth place ---
@@ -152,6 +170,8 @@ func devSet() []Example {
 			want{"г. Москве", recognizer.BirthPlace}),
 		ex("birthplace_born_bare", "родился в Москве",
 			want{"в Москве", recognizer.BirthPlace}),
+		ex("birthplace_bare_city", "Место рождения: Казань",
+			want{"Казань", recognizer.BirthPlace}),
 		ex("birthplace_negative_bare", "Москва", nil...),
 
 		// --- Citizenship ---
@@ -186,6 +206,8 @@ func devSet() []Example {
 		ex("address_negative_bare", "г. Москва, ул. Ленина, д. 5", nil...),
 		ex("address_branch_and_client", "адрес отделения: г. Москва, ул. Тверская, д. 1; адрес клиента: г. Москва, ул. Ленина, д. 5",
 			want{"г. Москва, ул. Ленина, д. 5", recognizer.Address}),
+		ex("address_composite", "Адрес проживания: г. Санкт-Петербург, ул. Большая Морская, д. 12А, кв. 7",
+			want{"г. Санкт-Петербург, ул. Большая Морская, д. 12А, кв. 7", recognizer.Address}),
 
 		// --- Card holder name ---
 		ex("cardholder_latin", "держатель карты IVAN IVANOV",
@@ -251,10 +273,23 @@ func heldOutSet() []Example {
 			want{"789", recognizer.CVV}),
 		ex("held_fullname", "заявитель Петров Пётр Петрович",
 			want{"Петров Пётр Петрович", recognizer.FullName}),
+		ex("held_fullname_uppercase", "ФИО: СИДОРОВ СИДОР СИДОРОВИЧ",
+			want{"СИДОРОВ СИДОР СИДОРОВИЧ", recognizer.FullName}),
+		ex("held_fullname_lowercase", "ФИО: петров пётр петрович",
+			want{"петров пётр петрович", recognizer.FullName}),
+		ex("held_given_name_field", "Имя: Мария",
+			want{"Мария", recognizer.FullName}),
+		ex("held_client_own_name", "Клиент Сергей Есенин",
+			want{"Сергей Есенин", recognizer.FullName}),
+		ex("held_negative_poet_reference", "Клиент читал стихи поэта Сергей Есенин", nil...),
 		ex("held_birthdate", "дата рождения 25 декабря 1985 года",
 			want{"25 декабря 1985 года", recognizer.BirthDate}),
+		ex("held_birthdate_uppercase_month", "Дата рождения: 5 ИЮНЯ 1988 года",
+			want{"5 ИЮНЯ 1988 года", recognizer.BirthDate}),
 		ex("held_birthplace", "место рождения: г. Санкт-Петербург",
 			want{"г. Санкт-Петербург", recognizer.BirthPlace}),
+		ex("held_birthplace_bare_city", "Место рождения: Тверь",
+			want{"Тверь", recognizer.BirthPlace}),
 		ex("held_birthplace_hyphen_alt", "родился в Ростове-на-Дону",
 			want{"в Ростове-на-Дону", recognizer.BirthPlace}),
 		ex("held_citizenship", "гражданство: Республика Беларусь",
@@ -265,8 +300,17 @@ func heldOutSet() []Example {
 			want{"УФМС России по г. Казани", recognizer.PassportAuthority}),
 		ex("held_issuedate", "дата выдачи 20.01.2010",
 			want{"20.01.2010", recognizer.PassportIssueDate}),
+		ex("held_passport_after_date_field", "Дата выдачи: 02.02.2021; паспорт 4511 654321",
+			want{"02.02.2021", recognizer.PassportIssueDate},
+			want{"4511 654321", recognizer.Passport}),
+		ex("held_card_after_amount_field", "Сумма: 250 рублей; карта: 5555 5555 5555 4444",
+			want{"5555 5555 5555 4444", recognizer.Card}),
+		ex("held_cvv_after_date_field", "Дата: 03.03.2022; CVV: 456",
+			want{"456", recognizer.CVV}),
 		ex("held_address", "зарегистрирован по адресу: г. Казань, ул. Баумана, д. 12, кв. 3",
 			want{"г. Казань, ул. Баумана, д. 12, кв. 3", recognizer.Address}),
+		ex("held_address_composite", "Адрес регистрации: г. Нижний Новгород, ул. Большая Покровская, д. 3Б, кв. 12",
+			want{"г. Нижний Новгород, ул. Большая Покровская, д. 3Б, кв. 12", recognizer.Address}),
 		ex("held_cardholder", "имя на карте PETROV PETR",
 			want{"PETROV PETR", recognizer.CardHolderName}),
 		ex("held_negative_poet", "поэт Александр Пушкин написал роман в стихах", nil...),

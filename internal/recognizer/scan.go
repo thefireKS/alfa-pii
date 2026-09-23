@@ -109,17 +109,37 @@ func snapToRuneEnd(s string, off int) int {
 	return off
 }
 
+// fieldBounds returns the byte range [lo, hi) of the field containing the span
+// [start, end). A field is a segment delimited by ';' or a newline. Binding
+// context to the field keeps a label in one field from leaking into a
+// neighbouring field: for example the word "дата" in "Дата выдачи: 01.01.2020;
+// паспорт 4510 123456" must not suppress the passport in the second field.
+func fieldBounds(text string, start, end int) (int, int) {
+	lo := start
+	for lo > 0 && text[lo-1] != ';' && text[lo-1] != '\n' && text[lo-1] != '\r' {
+		lo--
+	}
+	hi := end
+	for hi < len(text) && text[hi] != ';' && text[hi] != '\n' && text[hi] != '\r' {
+		hi++
+	}
+	return lo, hi
+}
+
 // hasContext reports whether any keyword appears as a whole word within a
-// window around the span [start,end). It is used to treat a requisite as
-// explicitly signed so it is masked even when a checksum fails.
+// window around the span [start,end), bounded by the field containing the span.
+// It is used to treat a requisite as explicitly signed so it is masked even
+// when a checksum fails. The field bound keeps a label in a neighbouring field
+// from affecting this value.
 func hasContext(text string, start, end int, keywords []string) bool {
+	flo, fhi := fieldBounds(text, start, end)
 	lo := start - 60
-	if lo < 0 {
-		lo = 0
+	if lo < flo {
+		lo = flo
 	}
 	hi := end + 60
-	if hi > len(text) {
-		hi = len(text)
+	if hi > fhi {
+		hi = fhi
 	}
 	lo = snapToRuneStart(text, lo)
 	hi = snapToRuneEnd(text, hi)
