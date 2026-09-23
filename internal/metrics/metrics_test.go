@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"alfa-hackathon.local/pii/internal/store"
 )
 
 // TestEstimateTokens verifies the token estimator is a documented heuristic
@@ -79,10 +81,10 @@ func TestMetricsHandlerBounded(t *testing.T) {
 // pending to replay.
 func TestStoreMetricsByAreaAndPhase(t *testing.T) {
 	m := New()
-	m.StoreRecordAdded(AreaProcess, PhasePending)
-	m.StoreBytesDelta(AreaProcess, PhasePending, 100)
-	m.StoreRecordAdded(AreaManaged, PhaseReplay)
-	m.StoreBytesDelta(AreaManaged, PhaseReplay, 50)
+	m.StoreRecordAdded(AreaProcess, store.PhasePending)
+	m.StoreBytesDelta(AreaProcess, store.PhasePending, 100)
+	m.StoreRecordAdded(AreaManaged, store.PhaseReplay)
+	m.StoreBytesDelta(AreaManaged, store.PhaseReplay, 50)
 
 	rec := httptest.NewRecorder()
 	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
@@ -98,10 +100,10 @@ func TestStoreMetricsByAreaAndPhase(t *testing.T) {
 		}
 	}
 	// A transition moves bytes from pending to replay.
-	m.StoreRecordRemoved(AreaProcess, PhasePending)
-	m.StoreBytesDelta(AreaProcess, PhasePending, -100)
-	m.StoreRecordAdded(AreaProcess, PhaseReplay)
-	m.StoreBytesDelta(AreaProcess, PhaseReplay, 100)
+	m.StoreRecordRemoved(AreaProcess, store.PhasePending)
+	m.StoreBytesDelta(AreaProcess, store.PhasePending, -100)
+	m.StoreRecordAdded(AreaProcess, store.PhaseReplay)
+	m.StoreBytesDelta(AreaProcess, store.PhaseReplay, 100)
 	rec = httptest.NewRecorder()
 	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body = rec.Body.String()

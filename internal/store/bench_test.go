@@ -17,7 +17,7 @@ func BenchmarkGetLiveRecords(b *testing.B) {
 			s := NewMemory(Limits{MaxEntries: n + 1, MaxBytes: 1 << 30, MaxRecordBytes: 1 << 20, TTL: time.Hour})
 			for i := 0; i < n; i++ {
 				key := fmt.Sprintf("key-%d", i)
-				if _, created, err := s.Create(context.Background(), key, build(rec("original", "masked"))); err != nil || !created {
+				if _, created, err := s.Create(context.Background(), key, minSize(key, "original"), build(rec("original", "masked"))); err != nil || !created {
 					b.Fatalf("seed create %d: created %v err %v", i, created, err)
 				}
 			}
@@ -48,7 +48,7 @@ func BenchmarkGetCreateDuringCleanup(b *testing.B) {
 			s.now = clock.now
 			for i := 0; i < n; i++ {
 				key := fmt.Sprintf("key-%d", i)
-				if _, created, err := s.Create(context.Background(), key, build(rec("original", "masked"))); err != nil || !created {
+				if _, created, err := s.Create(context.Background(), key, minSize(key, "original"), build(rec("original", "masked"))); err != nil || !created {
 					b.Fatalf("seed create %d: created %v err %v", i, created, err)
 				}
 			}
@@ -59,7 +59,7 @@ func BenchmarkGetCreateDuringCleanup(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				key := fmt.Sprintf("live-%d", i)
 				start := time.Now()
-				_, _, _ = s.Create(context.Background(), key, build(rec("original", "masked")))
+				_, _, _ = s.Create(context.Background(), key, minSize(key, "original"), build(rec("original", "masked")))
 				createLatency := time.Since(start)
 				start = time.Now()
 				_, _ = s.Get(key)

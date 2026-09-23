@@ -68,14 +68,6 @@ const (
 	AreaManaged = "managed"
 )
 
-// Store phases mirror the store's two-phase lifetime: pending (awaiting the
-// first restore) and replay (after the first successful restore). The phase is
-// a fixed label, never derived from request data.
-const (
-	PhasePending = "pending"
-	PhaseReplay  = "replay"
-)
-
 // Metrics holds the service's Prometheus collectors.
 type Metrics struct {
 	registry *prometheus.Registry

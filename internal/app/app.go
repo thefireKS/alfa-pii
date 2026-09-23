@@ -101,7 +101,7 @@ type Recognizer interface {
 // Store is the storage dependency used by the application.
 type Store interface {
 	Get(key string) (store.Record, bool)
-	Create(ctx context.Context, key string, build func(context.Context) (store.Record, error)) (store.Record, bool, error)
+	Create(ctx context.Context, key string, minSize int64, build func(context.Context) (store.Record, error)) (store.Record, bool, error)
 	// MarkRestored transitions a record to the replay phase after a successful
 	// restore, tied to the record version the caller read. It is a no-op when
 	// the record was re-created for the same key or is already in replay.
@@ -214,7 +214,7 @@ func (s *Service) Process(ctx context.Context, payloadID, payload string) (Resul
 		log.Info("stage", "stage", "operation", "direction", "mask_new")
 		var created bool
 		var err error
-		rec, created, err = s.create(ctx, s.processStore, key, func(ctx context.Context) (store.Record, error) {
+		rec, created, err = s.create(ctx, s.processStore, key, len(payload), func(ctx context.Context) (store.Record, error) {
 			if err := ctx.Err(); err != nil {
 				return store.Record{}, err
 			}
@@ -274,7 +274,7 @@ func (s *Service) Mask(ctx context.Context, consumerName, payloadID, payload str
 		log.Info("stage", "stage", "operation", "direction", "mask_new")
 		var created bool
 		var err error
-		rec, created, err = s.create(ctx, s.consumerStore, key, func(ctx context.Context) (store.Record, error) {
+		rec, created, err = s.create(ctx, s.consumerStore, key, len(payload), func(ctx context.Context) (store.Record, error) {
 			if err := ctx.Err(); err != nil {
 				return store.Record{}, err
 			}
@@ -344,8 +344,14 @@ func (s *Service) Restore(ctx context.Context, consumerName, payloadID, masked s
 		// Marker format: substitute the consumer's own markers inside the
 		// given text. Markers not in the table are left untouched.
 		log.Info("stage", "stage", "restoration")
-		s.consumerStore.MarkRestored(key, rec.Version)
-		return Result{Text: masker.Restore(masked, fromStoreTable(rec.Original, rec.Table)), Outcome: OutcomeRestore}, nil
+		restored := masker.Restore(masked, fromStoreTable(rec.Original, rec.Table))
+		// A restore that substituted no marker (the input had none of the
+		// consumer's own markers) is not a genuine restoration, so it does not
+		// complete the pair or extend the record's lifetime.
+		if restored != masked {
+			s.consumerStore.MarkRestored(key, rec.Version)
+		}
+		return Result{Text: restored, Outcome: OutcomeRestore}, nil
 	}
 }
 
@@ -426,9 +432,12 @@ func (s *Service) maskFor(c Consumer, text string) (string, []masker.Replacement
 
 // create inserts a new record into the given store, mapping capacity and busy
 // errors to the application-level errors. It reports whether this call created
-// the record (true) or another goroutine published it first (false).
-func (s *Service) create(ctx context.Context, st Store, key string, build func(context.Context) (store.Record, error)) (store.Record, bool, error) {
-	createdRec, created, err := st.Create(ctx, key, build)
+// the record (true) or another goroutine published it first (false). originalLen
+// is the length of the payload, used to compute the lower bound of the record's
+// memory footprint so the store can reserve capacity before recognition.
+func (s *Service) create(ctx context.Context, st Store, key string, originalLen int, build func(context.Context) (store.Record, error)) (store.Record, bool, error) {
+	minSize := store.MinRecordSize(key, originalLen)
+	createdRec, created, err := st.Create(ctx, key, minSize, build)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrCapacity):

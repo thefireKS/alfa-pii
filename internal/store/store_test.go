@@ -18,13 +18,19 @@ func build(rec Record) func(context.Context) (Record, error) {
 	return func(context.Context) (Record, error) { return rec, nil }
 }
 
+// minSize returns the lower-bound reservation size for a key and original text,
+// matching what the application layer passes to Create.
+func minSize(key, original string) int64 {
+	return MinRecordSize(key, len(original))
+}
+
 func testLimits() Limits {
 	return Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour, CreateWait: time.Second}
 }
 
 func TestCreateAndGet(t *testing.T) {
 	s := NewMemory(testLimits())
-	got, created, err := s.Create(context.Background(), "k", build(rec("orig", "mask")))
+	got, created, err := s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("orig", "mask")))
 	if err != nil || !created {
 		t.Fatalf("Create = created %v, err %v", created, err)
 	}
@@ -42,8 +48,8 @@ func TestCreateAndGet(t *testing.T) {
 
 func TestCreateExistingReturnsExisting(t *testing.T) {
 	s := NewMemory(testLimits())
-	_, _, _ = s.Create(context.Background(), "k", build(rec("orig", "mask")))
-	got, created, err := s.Create(context.Background(), "k", build(rec("other", "othermask")))
+	_, _, _ = s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("orig", "mask")))
+	got, created, err := s.Create(context.Background(), "k", minSize("k", "other"), build(rec("other", "othermask")))
 	if err != nil || created {
 		t.Fatalf("Create = created %v, err %v", created, err)
 	}
@@ -59,11 +65,11 @@ func TestCreateAtCapacitySkipsBuild(t *testing.T) {
 	limits := testLimits()
 	limits.MaxEntries = 1
 	s := NewMemory(limits)
-	if _, _, err := s.Create(context.Background(), "k1", build(rec("orig", "mask"))); err != nil {
+	if _, _, err := s.Create(context.Background(), "k1", minSize("k1", "orig"), build(rec("orig", "mask"))); err != nil {
 		t.Fatalf("first Create: %v", err)
 	}
 	built := false
-	_, _, err := s.Create(context.Background(), "k2", func(context.Context) (Record, error) {
+	_, _, err := s.Create(context.Background(), "k2", minSize("k2", "o"), func(context.Context) (Record, error) {
 		built = true
 		return rec("o", "m"), nil
 	})
@@ -84,7 +90,7 @@ func TestConcurrentCreateSameKey(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, created, _ := s.Create(context.Background(), "k", build(rec("orig", "mask")))
+			_, created, _ := s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("orig", "mask")))
 			if created {
 				results[i] = "created"
 			} else {
@@ -124,7 +130,7 @@ func TestConcurrentCreateSameKeySingleBuild(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			r, _, _ := s.Create(context.Background(), "k", builder)
+			r, _, _ := s.Create(context.Background(), "k", minSize("k", "orig"), builder)
 			masks[i] = r.Masked
 		}(i)
 	}
@@ -150,7 +156,7 @@ func TestCreateWaiterCancelled(t *testing.T) {
 	creatorDone := make(chan struct{})
 	go func() {
 		defer close(creatorDone)
-		_, _, _ = s.Create(context.Background(), "k", func(context.Context) (Record, error) {
+		_, _, _ = s.Create(context.Background(), "k", minSize("k", "orig"), func(context.Context) (Record, error) {
 			<-release
 			return rec("orig", "mask"), nil
 		})
@@ -161,7 +167,7 @@ func TestCreateWaiterCancelled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, err := s.Create(ctx, "k", build(rec("x", "y")))
+	_, _, err := s.Create(ctx, "k", minSize("k", "x"), build(rec("x", "y")))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("waiter err = %v, want context.Canceled", err)
 	}
@@ -182,7 +188,7 @@ func TestCreateCreatorCancelledNoDanglingReservation(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	go func() {
-		_, _, _ = s.Create(ctx, "k", func(c context.Context) (Record, error) {
+		_, _, _ = s.Create(ctx, "k", minSize("k", "orig"), func(c context.Context) (Record, error) {
 			close(started)
 			<-release
 			return rec("orig", "mask"), nil
@@ -195,7 +201,7 @@ func TestCreateCreatorCancelledNoDanglingReservation(t *testing.T) {
 	// The reservation must be released: a new create for the same key succeeds.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		_, created, err := s.Create(context.Background(), "k", build(rec("new", "newmask")))
+		_, created, err := s.Create(context.Background(), "k", minSize("k", "new"), build(rec("new", "newmask")))
 		if err == nil && created {
 			break
 		}
@@ -215,13 +221,13 @@ func TestCreateWaitTimeout(t *testing.T) {
 	creatorDone := make(chan struct{})
 	go func() {
 		defer close(creatorDone)
-		_, _, _ = s.Create(context.Background(), "k", func(context.Context) (Record, error) {
+		_, _, _ = s.Create(context.Background(), "k", minSize("k", "orig"), func(context.Context) (Record, error) {
 			<-release
 			return rec("orig", "mask"), nil
 		})
 	}()
 	time.Sleep(20 * time.Millisecond)
-	_, _, err := s.Create(context.Background(), "k", build(rec("x", "y")))
+	_, _, err := s.Create(context.Background(), "k", minSize("k", "x"), build(rec("x", "y")))
 	if !errors.Is(err, ErrBusy) {
 		t.Fatalf("err = %v, want ErrBusy", err)
 	}
@@ -231,25 +237,29 @@ func TestCreateWaitTimeout(t *testing.T) {
 
 func TestCapacityEntries(t *testing.T) {
 	s := NewMemory(Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour})
-	_, _, _ = s.Create(context.Background(), "a", build(rec("x", "y")))
-	_, _, err := s.Create(context.Background(), "b", build(rec("x", "y")))
+	_, _, _ = s.Create(context.Background(), "a", minSize("a", "x"), build(rec("x", "y")))
+	_, _, err := s.Create(context.Background(), "b", minSize("b", "x"), build(rec("x", "y")))
 	if !errors.Is(err, ErrCapacity) {
 		t.Fatalf("err = %v, want ErrCapacity", err)
 	}
 }
 
 func TestCapacityBytes(t *testing.T) {
-	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 10, MaxRecordBytes: 1 << 20, TTL: time.Hour})
-	_, _, _ = s.Create(context.Background(), "a", build(rec("12345", "67890")))
-	_, _, err := s.Create(context.Background(), "b", build(rec("12345", "67890")))
-	if !errors.Is(err, ErrCapacity) {
+	// Each record is 128 bytes of overhead plus a 1-byte key plus two 5-byte
+	// texts = 139 bytes. A budget of 200 fits one record but not two, so the
+	// first Create must succeed and only the second is rejected.
+	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 200, MaxRecordBytes: 1 << 20, TTL: time.Hour})
+	if _, created, err := s.Create(context.Background(), "a", minSize("a", "12345"), build(rec("12345", "67890"))); err != nil || !created {
+		t.Fatalf("first Create = created %v, err %v; want successful fill", created, err)
+	}
+	if _, _, err := s.Create(context.Background(), "b", minSize("b", "12345"), build(rec("12345", "67890"))); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("err = %v, want ErrCapacity", err)
 	}
 }
 
 func TestCapacityRecordBytes(t *testing.T) {
 	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 10, TTL: time.Hour})
-	_, _, err := s.Create(context.Background(), "a", build(rec("12345", "67890")))
+	_, _, err := s.Create(context.Background(), "a", minSize("a", "12345"), build(rec("12345", "67890")))
 	if !errors.Is(err, ErrCapacity) {
 		t.Fatalf("err = %v, want ErrCapacity", err)
 	}
@@ -261,12 +271,12 @@ func TestCapacityReleasedAfterCleanup(t *testing.T) {
 	now := time.Now()
 	s := NewMemory(Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute})
 	s.now = func() time.Time { return now }
-	_, _, _ = s.Create(context.Background(), "a", build(rec("x", "y")))
-	if _, _, err := s.Create(context.Background(), "b", build(rec("x", "y"))); !errors.Is(err, ErrCapacity) {
+	_, _, _ = s.Create(context.Background(), "a", minSize("a", "x"), build(rec("x", "y")))
+	if _, _, err := s.Create(context.Background(), "b", minSize("b", "x"), build(rec("x", "y"))); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("expected capacity error, got %v", err)
 	}
 	s.now = func() time.Time { return now.Add(2 * time.Minute) }
-	_, created, err := s.Create(context.Background(), "b", build(rec("x", "y")))
+	_, created, err := s.Create(context.Background(), "b", minSize("b", "x"), build(rec("x", "y")))
 	if err != nil || !created {
 		t.Fatalf("create after cleanup = created %v, err %v", created, err)
 	}
@@ -277,7 +287,7 @@ func TestTTLExpiry(t *testing.T) {
 	s := NewMemory(testLimits())
 	s.limits.TTL = time.Minute
 	s.now = func() time.Time { return now }
-	_, _, _ = s.Create(context.Background(), "k", build(rec("orig", "mask")))
+	_, _, _ = s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("orig", "mask")))
 	if _, ok := s.Get("k"); !ok {
 		t.Fatal("record should be present before TTL")
 	}
@@ -286,7 +296,7 @@ func TestTTLExpiry(t *testing.T) {
 		t.Fatal("record should be expired after TTL")
 	}
 	// Expired record must not block a new create for the same key.
-	_, created, err := s.Create(context.Background(), "k", build(rec("new", "newmask")))
+	_, created, err := s.Create(context.Background(), "k", minSize("k", "new"), build(rec("new", "newmask")))
 	if err != nil || !created {
 		t.Fatalf("Create after expiry = created %v, err %v", created, err)
 	}
@@ -329,7 +339,7 @@ func TestCleanupRaceAcrossTTL(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 200; j++ {
 				key := string(rune('a'+i)) + string(rune('0'+j%10))
-				_, _, _ = s.Create(context.Background(), key, build(rec("orig", "mask")))
+				_, _, _ = s.Create(context.Background(), key, minSize(key, "orig"), build(rec("orig", "mask")))
 				_, _ = s.Get(key)
 			}
 		}(i)
@@ -347,8 +357,8 @@ func TestCleanupRaceAcrossTTL(t *testing.T) {
 // "consumer + payload_id" dimension) never collide.
 func TestDifferentKeysIndependent(t *testing.T) {
 	s := NewMemory(testLimits())
-	_, _, _ = s.Create(context.Background(), "scope1:id", build(rec("orig1", "mask1")))
-	_, _, _ = s.Create(context.Background(), "scope2:id", build(rec("orig2", "mask2")))
+	_, _, _ = s.Create(context.Background(), "scope1:id", minSize("scope1:id", "orig1"), build(rec("orig1", "mask1")))
+	_, _, _ = s.Create(context.Background(), "scope2:id", minSize("scope2:id", "orig2"), build(rec("orig2", "mask2")))
 	r1, _ := s.Get("scope1:id")
 	r2, _ := s.Get("scope2:id")
 	if r1.Masked != "mask1" || r2.Masked != "mask2" {
@@ -363,7 +373,7 @@ func TestDifferentKeysIndependent(t *testing.T) {
 func TestLongKeyCounted(t *testing.T) {
 	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour})
 	key := strings.Repeat("k", 1<<20)
-	if _, _, err := s.Create(context.Background(), key, build(rec("", ""))); !errors.Is(err, ErrCapacity) {
+	if _, _, err := s.Create(context.Background(), key, minSize(key, ""), build(rec("", ""))); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("Create with 1 MiB key = err %v, want ErrCapacity", err)
 	}
 	if s.bytes != 0 {
@@ -378,10 +388,10 @@ func TestKeyCountedAgainstTotalBytes(t *testing.T) {
 	// need 2*(128+100)=456 bytes; a budget of 400 must reject the second.
 	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 400, MaxRecordBytes: 1 << 20, TTL: time.Hour})
 	key := strings.Repeat("k", 100)
-	if _, created, err := s.Create(context.Background(), key, build(rec("", ""))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), key, minSize(key, ""), build(rec("", ""))); err != nil || !created {
 		t.Fatalf("first Create = created %v, err %v", created, err)
 	}
-	if _, _, err := s.Create(context.Background(), key+"x", build(rec("", ""))); !errors.Is(err, ErrCapacity) {
+	if _, _, err := s.Create(context.Background(), key+"x", minSize(key+"x", ""), build(rec("", ""))); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("second Create = err %v, want ErrCapacity", err)
 	}
 }
@@ -400,7 +410,7 @@ func TestConcurrentFillRespectsLimit(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			key := fmt.Sprintf("k%d", i)
-			_, c, err := s.Create(context.Background(), key, build(rec(strings.Repeat("o", perRecord), strings.Repeat("m", perRecord))))
+			_, c, err := s.Create(context.Background(), key, minSize(key, strings.Repeat("o", perRecord)), build(rec(strings.Repeat("o", perRecord), strings.Repeat("m", perRecord))))
 			if err == nil {
 				created[i] = c
 			}
@@ -431,13 +441,13 @@ func TestTTLExpiryViaHeap(t *testing.T) {
 	now := time.Now()
 	s := NewMemory(Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute})
 	s.now = func() time.Time { return now }
-	if _, created, err := s.Create(context.Background(), "a", build(rec("x", "y"))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), "a", minSize("a", "x"), build(rec("x", "y"))); err != nil || !created {
 		t.Fatalf("Create a = created %v, err %v", created, err)
 	}
 	s.now = func() time.Time { return now.Add(2 * time.Minute) }
 	// The store is at MaxEntries=1 and the only record is expired; a new create
 	// must drain it and succeed.
-	if _, created, err := s.Create(context.Background(), "b", build(rec("x", "y"))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), "b", minSize("b", "x"), build(rec("x", "y"))); err != nil || !created {
 		t.Fatalf("Create b after expiry = created %v, err %v", created, err)
 	}
 	if _, ok := s.Get("a"); ok {
@@ -450,7 +460,7 @@ func TestTTLExpiryViaHeap(t *testing.T) {
 // original again.
 func TestRepeatAfterLostResponse(t *testing.T) {
 	s := NewMemory(testLimits())
-	if _, created, err := s.Create(context.Background(), "k", build(rec("orig", "mask"))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("orig", "mask"))); err != nil || !created {
 		t.Fatalf("Create = created %v, err %v", created, err)
 	}
 	for i := 0; i < 3; i++ {
@@ -470,7 +480,7 @@ func TestCounterSymmetric(t *testing.T) {
 	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute})
 	s.now = func() time.Time { return now }
 	s.SetObserver(obs)
-	if _, created, err := s.Create(context.Background(), "k", build(rec("orig", "mask"))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("orig", "mask"))); err != nil || !created {
 		t.Fatalf("Create = created %v, err %v", created, err)
 	}
 	if s.bytes <= 0 {
@@ -514,7 +524,7 @@ func TestExactTTLBoundaryExpires(t *testing.T) {
 	clock := &fakeClock{t: time.Now()}
 	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute})
 	s.now = clock.now
-	if _, created, err := s.Create(context.Background(), "k", build(rec("orig", "mask"))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("orig", "mask"))); err != nil || !created {
 		t.Fatalf("Create = created %v, err %v", created, err)
 	}
 	// Advance exactly to the deadline: now == createdAt + TTL.
@@ -535,7 +545,7 @@ func TestMassExpiryBatched(t *testing.T) {
 	s.now = clock.now
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("k%d", i)
-		if _, created, err := s.Create(context.Background(), key, build(rec("orig", "mask"))); err != nil || !created {
+		if _, created, err := s.Create(context.Background(), key, minSize(key, "orig"), build(rec("orig", "mask"))); err != nil || !created {
 			t.Fatalf("seed create %d = created %v, err %v", i, created, err)
 		}
 	}
@@ -575,7 +585,7 @@ func TestCreateAtCapacityDrainsBoundedBatch(t *testing.T) {
 	s.now = clock.now
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("k%d", i)
-		if _, created, err := s.Create(context.Background(), key, build(rec("orig", "mask"))); err != nil || !created {
+		if _, created, err := s.Create(context.Background(), key, minSize(key, "orig"), build(rec("orig", "mask"))); err != nil || !created {
 			t.Fatalf("seed create %d = created %v, err %v", i, created, err)
 		}
 	}
@@ -584,7 +594,7 @@ func TestCreateAtCapacityDrainsBoundedBatch(t *testing.T) {
 	// The store is full of expired records. A Create drains a bounded number of
 	// batches (one before the capacity check and one before publish) and then
 	// accepts the new record; the rest of the backlog is left for cleanup.
-	if _, created, err := s.Create(context.Background(), "new", build(rec("o", "m"))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), "new", minSize("new", "o"), build(rec("o", "m"))); err != nil || !created {
 		t.Fatalf("Create after expiry = created %v, err %v", created, err)
 	}
 	if _, ok := s.Get("new"); !ok {
@@ -603,11 +613,11 @@ func TestRecreateKeyOldNodeDoesNotDeleteNew(t *testing.T) {
 	clock := &fakeClock{t: time.Now()}
 	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute})
 	s.now = clock.now
-	if _, created, err := s.Create(context.Background(), "k", build(rec("old", "oldmask"))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), "k", minSize("k", "old"), build(rec("old", "oldmask"))); err != nil || !created {
 		t.Fatalf("first Create = created %v, err %v", created, err)
 	}
 	clock.advance(2 * time.Minute)
-	if _, created, err := s.Create(context.Background(), "k", build(rec("new", "newmask"))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), "k", minSize("k", "new"), build(rec("new", "newmask"))); err != nil || !created {
 		t.Fatalf("re-create = created %v, err %v", created, err)
 	}
 	// The new record must survive a drain that runs after its creation.
@@ -643,7 +653,7 @@ func TestObserverNotCalledUnderMutex(t *testing.T) {
 	s.now = clock.now
 	obs := &mutexCheckingObserver{store: s}
 	s.SetObserver(obs)
-	if _, created, err := s.Create(context.Background(), "k", build(rec("orig", "mask"))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("orig", "mask"))); err != nil || !created {
 		t.Fatalf("Create = created %v, err %v", created, err)
 	}
 	clock.advance(2 * time.Minute)
@@ -689,7 +699,7 @@ func TestLongKeyReleasedAfterEviction(t *testing.T) {
 	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 30, MaxRecordBytes: 1 << 30, TTL: time.Minute})
 	s.now = clock.now
 	key := strings.Repeat("k", 1<<20)
-	if _, created, err := s.Create(context.Background(), key, build(rec("orig", "mask"))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), key, minSize(key, "orig"), build(rec("orig", "mask"))); err != nil || !created {
 		t.Fatalf("Create = created %v, err %v", created, err)
 	}
 	clock.advance(2 * time.Minute)
@@ -723,7 +733,7 @@ func TestConcurrentGetCreateAcrossTTL(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < n; j++ {
 				key := fmt.Sprintf("k%d", j)
-				_, _, _ = s.Create(context.Background(), key, build(rec("orig", "mask")))
+				_, _, _ = s.Create(context.Background(), key, minSize(key, "orig"), build(rec("orig", "mask")))
 				_, _ = s.Get(key)
 			}
 		}()
@@ -751,7 +761,7 @@ func TestMarkRestoredTransitionsToReplay(t *testing.T) {
 	clock := &fakeClock{t: time.Now()}
 	s := NewMemory(replayLimits())
 	s.now = clock.now
-	rec, created, err := s.Create(context.Background(), "k", build(rec("orig", "mask")))
+	rec, created, err := s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("orig", "mask")))
 	if err != nil || !created {
 		t.Fatalf("Create = created %v, err %v", created, err)
 	}
@@ -783,7 +793,7 @@ func TestMarkRestoredDoesNotExtendOnRepeat(t *testing.T) {
 	clock := &fakeClock{t: time.Now()}
 	s := NewMemory(replayLimits())
 	s.now = clock.now
-	rec, _, err := s.Create(context.Background(), "k", build(rec("orig", "mask")))
+	rec, _, err := s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("orig", "mask")))
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -810,13 +820,13 @@ func TestMarkRestoredVersionTie(t *testing.T) {
 	clock := &fakeClock{t: time.Now()}
 	s := NewMemory(replayLimits())
 	s.now = clock.now
-	oldRec, _, err := s.Create(context.Background(), "k", build(rec("old", "oldmask")))
+	oldRec, _, err := s.Create(context.Background(), "k", minSize("k", "old"), build(rec("old", "oldmask")))
 	if err != nil {
 		t.Fatalf("first Create: %v", err)
 	}
 	// The old record expires and a new record is created for the same key.
 	clock.advance(2 * time.Minute)
-	newRec, created, err := s.Create(context.Background(), "k", build(rec("new", "newmask")))
+	newRec, created, err := s.Create(context.Background(), "k", minSize("k", "new"), build(rec("new", "newmask")))
 	if err != nil || !created {
 		t.Fatalf("re-create = created %v, err %v", created, err)
 	}
@@ -845,7 +855,7 @@ func TestMarkRestoredRejectsMissingAndWrongVersion(t *testing.T) {
 	if s.MarkRestored("missing", 1) {
 		t.Fatal("MarkRestored on missing key should be rejected")
 	}
-	rec, _, err := s.Create(context.Background(), "k", build(rec("orig", "mask")))
+	rec, _, err := s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("orig", "mask")))
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -867,7 +877,7 @@ func TestReplayPhaseExpiresAfterReplayTTL(t *testing.T) {
 	clock := &fakeClock{t: time.Now()}
 	s := NewMemory(Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute, ReplayTTL: 2 * time.Minute})
 	s.now = clock.now
-	r, _, err := s.Create(context.Background(), "a", build(rec("orig", "mask")))
+	r, _, err := s.Create(context.Background(), "a", minSize("a", "orig"), build(rec("orig", "mask")))
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -878,13 +888,13 @@ func TestReplayPhaseExpiresAfterReplayTTL(t *testing.T) {
 	}
 	// The store is at MaxEntries=1; a new pair must be rejected while the
 	// completed pair is still in the replay window.
-	if _, _, err := s.Create(context.Background(), "b", build(rec("x", "y"))); !errors.Is(err, ErrCapacity) {
+	if _, _, err := s.Create(context.Background(), "b", minSize("b", "x"), build(rec("x", "y"))); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("Create b during replay = err %v, want ErrCapacity", err)
 	}
 	// After the replay window elapses the completed pair is released and a new
 	// pair is accepted.
 	clock.advance(2 * time.Minute)
-	if _, created, err := s.Create(context.Background(), "b", build(rec("x", "y"))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), "b", minSize("b", "x"), build(rec("x", "y"))); err != nil || !created {
 		t.Fatalf("Create b after replay expiry = created %v, err %v", created, err)
 	}
 }
@@ -895,15 +905,15 @@ func TestPendingPhaseExpiresAfterTTL(t *testing.T) {
 	clock := &fakeClock{t: time.Now()}
 	s := NewMemory(Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute, ReplayTTL: 2 * time.Minute})
 	s.now = clock.now
-	if _, _, err := s.Create(context.Background(), "a", build(rec("orig", "mask"))); err != nil {
+	if _, _, err := s.Create(context.Background(), "a", minSize("a", "orig"), build(rec("orig", "mask"))); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if _, _, err := s.Create(context.Background(), "b", build(rec("x", "y"))); !errors.Is(err, ErrCapacity) {
+	if _, _, err := s.Create(context.Background(), "b", minSize("b", "x"), build(rec("x", "y"))); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("Create b at capacity = err %v, want ErrCapacity", err)
 	}
 	// The un-restored record expires after the ordinary TTL.
 	clock.advance(2 * time.Minute)
-	if _, created, err := s.Create(context.Background(), "b", build(rec("x", "y"))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), "b", minSize("b", "x"), build(rec("x", "y"))); err != nil || !created {
 		t.Fatalf("Create b after TTL = created %v, err %v", created, err)
 	}
 }
@@ -917,7 +927,7 @@ func TestObserverSeesPhaseTransition(t *testing.T) {
 	s := NewMemory(replayLimits())
 	s.now = clock.now
 	s.SetObserver(obs)
-	rec, _, err := s.Create(context.Background(), "k", build(rec("orig", "mask")))
+	rec, _, err := s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("orig", "mask")))
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -960,7 +970,7 @@ func TestReplayDrainUsesReplayDeadline(t *testing.T) {
 	clock := &fakeClock{t: time.Now()}
 	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute, ReplayTTL: 2 * time.Minute})
 	s.now = clock.now
-	rec, _, err := s.Create(context.Background(), "k", build(rec("orig", "mask")))
+	rec, _, err := s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("orig", "mask")))
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -974,5 +984,343 @@ func TestReplayDrainUsesReplayDeadline(t *testing.T) {
 	s.drainAll()
 	if _, ok := s.Get("k"); ok {
 		t.Fatal("replay-phase record should be drained at its replay deadline")
+	}
+}
+
+// TestConcurrentDifferentKeysSingleBuildAtEntryLimit verifies that when the
+// entry limit is reached, concurrent creators for different keys are rejected
+// at reservation time before running build, so only the winning creator's build
+// runs. This is the diagnostic scenario where MaxEntries=1 previously started
+// many builds for different keys even though only one record could be published.
+func TestConcurrentDifferentKeysSingleBuildAtEntryLimit(t *testing.T) {
+	s := NewMemory(Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour})
+	var mu sync.Mutex
+	builds := 0
+	const n = 16
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			key := fmt.Sprintf("k%d", i)
+			_, _, _ = s.Create(context.Background(), key, minSize(key, "o"), func(context.Context) (Record, error) {
+				mu.Lock()
+				builds++
+				mu.Unlock()
+				return rec("o", "m"), nil
+			})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	mu.Lock()
+	b := builds
+	mu.Unlock()
+	if b != 1 {
+		t.Fatalf("builds = %d, want 1 (only the winning creator runs build)", b)
+	}
+	if s.reservedBytes != 0 || s.reservedEntries != 0 {
+		t.Fatalf("reserved bytes=%d entries=%d, want 0 after all creators finish", s.reservedBytes, s.reservedEntries)
+	}
+}
+
+// TestConcurrentDifferentKeysReserveBudget verifies that concurrent creators for
+// different keys reserve both entries and bytes against the shared budget, so
+// the sum of reservations and published records never exceeds the budget even
+// while many builds are in flight.
+func TestConcurrentDifferentKeysReserveBudget(t *testing.T) {
+	const perRecord = 100
+	s := NewMemory(Limits{MaxEntries: 1000, MaxBytes: 10 * perRecord, MaxRecordBytes: 1 << 20, TTL: time.Hour})
+	const n = 100
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			key := fmt.Sprintf("k%d", i)
+			_, _, _ = s.Create(context.Background(), key, minSize(key, strings.Repeat("o", perRecord)), build(rec(strings.Repeat("o", perRecord), strings.Repeat("m", perRecord))))
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	if s.bytes+s.reservedBytes > 10*perRecord {
+		t.Fatalf("bytes+reserved = %d, exceeded budget %d", s.bytes+s.reservedBytes, 10*perRecord)
+	}
+	if s.reservedBytes != 0 || s.reservedEntries != 0 {
+		t.Fatalf("reserved bytes=%d entries=%d, want 0 after all creators finish", s.reservedBytes, s.reservedEntries)
+	}
+}
+
+// TestWaitersShareBuildError verifies that when the creator's build fails with a
+// persistent error, all waiters receive the same error and do not retry, so the
+// expensive build runs only once. This is the diagnostic scenario where 17 calls
+// of one ID with a persistent build error previously produced 17 build runs.
+func TestWaitersShareBuildError(t *testing.T) {
+	s := NewMemory(testLimits())
+	release := make(chan struct{})
+	buildErr := errors.New("build failed")
+	var mu sync.Mutex
+	builds := 0
+	creatorDone := make(chan struct{})
+	go func() {
+		defer close(creatorDone)
+		_, _, _ = s.Create(context.Background(), "k", minSize("k", "orig"), func(context.Context) (Record, error) {
+			mu.Lock()
+			builds++
+			mu.Unlock()
+			<-release
+			return Record{}, buildErr
+		})
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	const n = 16
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	var ready sync.WaitGroup
+	ready.Add(n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ready.Done()
+			_, _, err := s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("x", "y")))
+			errs[i] = err
+		}(i)
+	}
+	// Wait for every waiter to have started, then give them time to reach the
+	// inflight wait before the creator fails, so each one observes the shared
+	// error rather than becoming a creator itself.
+	ready.Wait()
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	<-creatorDone
+
+	mu.Lock()
+	b := builds
+	mu.Unlock()
+	if b != 1 {
+		t.Fatalf("builds = %d, want 1", b)
+	}
+	for i := 0; i < n; i++ {
+		if !errors.Is(errs[i], buildErr) {
+			t.Fatalf("waiter %d err = %v, want buildErr", i, errs[i])
+		}
+	}
+	if s.reservedBytes != 0 || s.reservedEntries != 0 {
+		t.Fatalf("reserved bytes=%d entries=%d, want 0 after build error", s.reservedBytes, s.reservedEntries)
+	}
+}
+
+// TestWaitersShareCapacityError verifies that a capacity refusal at publish time
+// by the creator is passed to all waiters unchanged, so they do not each retry
+// and re-run the expensive build.
+func TestWaitersShareCapacityError(t *testing.T) {
+	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 10, TTL: time.Hour})
+	release := make(chan struct{})
+	creatorDone := make(chan struct{})
+	go func() {
+		defer close(creatorDone)
+		_, _, _ = s.Create(context.Background(), "k", minSize("k", "12345"), func(context.Context) (Record, error) {
+			<-release
+			return rec("12345", "67890"), nil
+		})
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	const n = 8
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	var ready sync.WaitGroup
+	ready.Add(n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ready.Done()
+			_, _, err := s.Create(context.Background(), "k", minSize("k", "12345"), build(rec("x", "y")))
+			errs[i] = err
+		}(i)
+	}
+	ready.Wait()
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	<-creatorDone
+
+	for i := 0; i < n; i++ {
+		if !errors.Is(errs[i], ErrCapacity) {
+			t.Fatalf("waiter %d err = %v, want ErrCapacity", i, errs[i])
+		}
+	}
+	if s.reservedBytes != 0 || s.reservedEntries != 0 {
+		t.Fatalf("reserved bytes=%d entries=%d, want 0 after capacity refusal", s.reservedBytes, s.reservedEntries)
+	}
+}
+
+// TestCreatorCancelledWaiterRetries verifies that when the creator is cancelled
+// by its own context, a waiter with a still-live context retries and becomes the
+// creator, publishing its own record.
+func TestCreatorCancelledWaiterRetries(t *testing.T) {
+	s := NewMemory(testLimits())
+	creatorCtx, cancelCreator := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	creatorDone := make(chan struct{})
+	go func() {
+		defer close(creatorDone)
+		_, _, _ = s.Create(creatorCtx, "k", minSize("k", "orig"), func(c context.Context) (Record, error) {
+			close(started)
+			<-release
+			return rec("orig", "mask"), nil
+		})
+	}()
+	<-started
+
+	waiterDone := make(chan struct{})
+	var waiterRec Record
+	var waiterCreated bool
+	var waiterErr error
+	go func() {
+		defer close(waiterDone)
+		waiterRec, waiterCreated, waiterErr = s.Create(context.Background(), "k", minSize("k", "new"), build(rec("new", "newmask")))
+	}()
+
+	cancelCreator()
+	close(release)
+	<-creatorDone
+	<-waiterDone
+
+	if waiterErr != nil || !waiterCreated {
+		t.Fatalf("waiter = created %v, err %v; want it to retry and create", waiterCreated, waiterErr)
+	}
+	if waiterRec.Original != "new" {
+		t.Fatalf("waiter rec = %+v, want the waiter's record", waiterRec)
+	}
+	if s.reservedBytes != 0 || s.reservedEntries != 0 {
+		t.Fatalf("reserved bytes=%d entries=%d, want 0 after retry", s.reservedBytes, s.reservedEntries)
+	}
+}
+
+// TestReservationReleasedOnBuildError verifies that a build error releases the
+// reservation exactly once and a new record can be created afterwards.
+func TestReservationReleasedOnBuildError(t *testing.T) {
+	s := NewMemory(Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour})
+	buildErr := errors.New("build failed")
+	if _, _, err := s.Create(context.Background(), "k", minSize("k", "orig"), func(context.Context) (Record, error) {
+		return Record{}, buildErr
+	}); !errors.Is(err, buildErr) {
+		t.Fatalf("err = %v, want buildErr", err)
+	}
+	if s.reservedBytes != 0 || s.reservedEntries != 0 {
+		t.Fatalf("reserved bytes=%d entries=%d, want 0 after build error", s.reservedBytes, s.reservedEntries)
+	}
+	if _, created, err := s.Create(context.Background(), "k", minSize("k", "new"), build(rec("new", "newmask"))); err != nil || !created {
+		t.Fatalf("Create after build error = created %v, err %v", created, err)
+	}
+}
+
+// TestReservationReleasedOnCancel verifies that cancelling the creator releases
+// the reservation exactly once.
+func TestReservationReleasedOnCancel(t *testing.T) {
+	s := NewMemory(testLimits())
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _ = s.Create(ctx, "k", minSize("k", "orig"), func(c context.Context) (Record, error) {
+			close(started)
+			<-release
+			return rec("orig", "mask"), nil
+		})
+	}()
+	<-started
+	cancel()
+	close(release)
+	<-done
+	if s.reservedBytes != 0 || s.reservedEntries != 0 {
+		t.Fatalf("reserved bytes=%d entries=%d, want 0 after cancel", s.reservedBytes, s.reservedEntries)
+	}
+}
+
+// TestReservationReleasedOnMaxRecordBytes verifies that a post-build refusal for
+// exceeding the per-record limit releases the reservation exactly once.
+func TestReservationReleasedOnMaxRecordBytes(t *testing.T) {
+	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 10, TTL: time.Hour})
+	if _, _, err := s.Create(context.Background(), "k", minSize("k", "12345"), build(rec("12345", "67890"))); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("err = %v, want ErrCapacity", err)
+	}
+	if s.reservedBytes != 0 || s.reservedEntries != 0 {
+		t.Fatalf("reserved bytes=%d entries=%d, want 0 after MaxRecordBytes rejection", s.reservedBytes, s.reservedEntries)
+	}
+}
+
+// TestImpossibleRequestRejectedBeforeBuild verifies that a request whose minimum
+// size cannot fit in the remaining budget is rejected before build runs, and the
+// existing pair remains readable.
+func TestImpossibleRequestRejectedBeforeBuild(t *testing.T) {
+	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 200, MaxRecordBytes: 1 << 20, TTL: time.Hour})
+	if _, created, err := s.Create(context.Background(), "a", minSize("a", "12345"), build(rec("12345", "67890"))); err != nil || !created {
+		t.Fatalf("first Create = created %v, err %v", created, err)
+	}
+	built := false
+	if _, _, err := s.Create(context.Background(), "b", minSize("b", "12345"), func(context.Context) (Record, error) {
+		built = true
+		return rec("12345", "67890"), nil
+	}); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("err = %v, want ErrCapacity", err)
+	}
+	if built {
+		t.Fatal("build was invoked for a request rejected before recognition")
+	}
+	if _, ok := s.Get("a"); !ok {
+		t.Fatal("existing pair lost after capacity refusal")
+	}
+}
+
+// TestReadAtCapacity verifies that reading and repeating a stored pair works
+// when the store is at capacity for new records.
+func TestReadAtCapacity(t *testing.T) {
+	s := NewMemory(Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour})
+	if _, created, err := s.Create(context.Background(), "a", minSize("a", "orig"), build(rec("orig", "mask"))); err != nil || !created {
+		t.Fatalf("Create = created %v, err %v", created, err)
+	}
+	if _, _, err := s.Create(context.Background(), "b", minSize("b", "x"), build(rec("x", "y"))); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("Create b = err %v, want ErrCapacity", err)
+	}
+	for i := 0; i < 3; i++ {
+		r, ok := s.Get("a")
+		if !ok || r.Original != "orig" || r.Masked != "mask" {
+			t.Fatalf("repeat %d: got %+v, %v", i, r, ok)
+		}
+	}
+}
+
+// TestReservationReleasedAfterTTL verifies that after a record expires and is
+// reclaimed, the store accepts new records again, so a full store that only
+// holds expired correspondences can accept new ones.
+func TestReservationReleasedAfterTTL(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	s := NewMemory(Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute})
+	s.now = clock.now
+	if _, created, err := s.Create(context.Background(), "a", minSize("a", "x"), build(rec("x", "y"))); err != nil || !created {
+		t.Fatalf("Create a = created %v, err %v", created, err)
+	}
+	if _, _, err := s.Create(context.Background(), "b", minSize("b", "x"), build(rec("x", "y"))); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("Create b at capacity = err %v, want ErrCapacity", err)
+	}
+	clock.advance(2 * time.Minute)
+	if _, created, err := s.Create(context.Background(), "b", minSize("b", "x"), build(rec("x", "y"))); err != nil || !created {
+		t.Fatalf("Create b after TTL = created %v, err %v", created, err)
+	}
+	if s.reservedBytes != 0 || s.reservedEntries != 0 {
+		t.Fatalf("reserved bytes=%d entries=%d, want 0", s.reservedBytes, s.reservedEntries)
 	}
 }

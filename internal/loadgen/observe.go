@@ -105,9 +105,9 @@ func (p *MetricsPoller) pollMetrics(ctx context.Context) ServiceMetrics {
 
 var (
 	reRequests = regexp.MustCompile(`pii_requests_total\{operation="([^"]+)",outcome="([^"]+)"\} (\d+)`)
-	reRecords  = regexp.MustCompile(`pii_store_records (\d+)`)
-	reBytes    = regexp.MustCompile(`pii_store_bytes ([0-9.eE+]+)`)
-	reTTL      = regexp.MustCompile(`pii_store_ttl_expired_total (\d+)`)
+	reRecords  = regexp.MustCompile(`pii_store_records\{area="[^"]+",phase="[^"]+"\} (\d+)`)
+	reBytes    = regexp.MustCompile(`pii_store_bytes\{area="[^"]+",phase="[^"]+"\} ([0-9.eE+]+)`)
+	reTTL      = regexp.MustCompile(`pii_store_ttl_expired_total\{area="[^"]+",phase="[^"]+"\} (\d+)`)
 	reFail     = regexp.MustCompile(`pii_store_failures_total\{reason="([^"]+)"\} (\d+)`)
 	reActive   = regexp.MustCompile(`pii_active_requests (\d+)`)
 )
@@ -117,15 +117,20 @@ func parseMetrics(body string, sm *ServiceMetrics) {
 		n, _ := strconv.ParseInt(m[3], 10, 64)
 		sm.RequestsTotal[m[1]+"|"+m[2]] = n
 	}
-	if m := reRecords.FindStringSubmatch(body); m != nil {
-		sm.StoreRecords, _ = strconv.ParseInt(m[1], 10, 64)
+	// Store metrics are now broken down by area and phase; sum across all label
+	// combinations so the load generator reports the total held records, bytes
+	// and TTL evictions.
+	for _, m := range reRecords.FindAllStringSubmatch(body, -1) {
+		n, _ := strconv.ParseInt(m[1], 10, 64)
+		sm.StoreRecords += n
 	}
-	if m := reBytes.FindStringSubmatch(body); m != nil {
+	for _, m := range reBytes.FindAllStringSubmatch(body, -1) {
 		f, _ := strconv.ParseFloat(m[1], 64)
-		sm.StoreBytes = int64(f)
+		sm.StoreBytes += int64(f)
 	}
-	if m := reTTL.FindStringSubmatch(body); m != nil {
-		sm.StoreTTL, _ = strconv.ParseInt(m[1], 10, 64)
+	for _, m := range reTTL.FindAllStringSubmatch(body, -1) {
+		n, _ := strconv.ParseInt(m[1], 10, 64)
+		sm.StoreTTL += n
 	}
 	for _, m := range reFail.FindAllStringSubmatch(body, -1) {
 		n, _ := strconv.ParseInt(m[2], 10, 64)

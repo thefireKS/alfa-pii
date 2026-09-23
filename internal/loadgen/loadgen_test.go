@@ -290,9 +290,12 @@ func TestRunnerCompatibilityCheck(t *testing.T) {
 }
 
 func TestParseMetricsScientificNotation(t *testing.T) {
-	body := `pii_store_records 5210
-pii_store_bytes 4.08003e+06
-pii_store_ttl_expired_total 3
+	body := `pii_store_records{area="process",phase="pending"} 5000
+pii_store_records{area="process",phase="replay"} 210
+pii_store_bytes{area="process",phase="pending"} 4.08e+06
+pii_store_bytes{area="process",phase="replay"} 30
+pii_store_ttl_expired_total{area="process",phase="pending"} 2
+pii_store_ttl_expired_total{area="process",phase="replay"} 1
 pii_store_failures_total{reason="capacity"} 2
 pii_active_requests 7
 pii_requests_total{operation="process",outcome="mask"} 100`
@@ -300,6 +303,7 @@ pii_requests_total{operation="process",outcome="mask"} 100`
 	sm.RequestsTotal = make(map[string]int64)
 	sm.StoreFailures = make(map[string]int64)
 	parseMetrics(body, &sm)
+	// Store metrics are summed across area/phase label combinations.
 	if sm.StoreRecords != 5210 {
 		t.Errorf("records=%d want 5210", sm.StoreRecords)
 	}

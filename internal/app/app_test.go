@@ -262,6 +262,33 @@ func TestProcessCapacity(t *testing.T) {
 	}
 }
 
+// TestProcessReadAtCapacity verifies that a stored pair remains readable and
+// repeatable when the store is at capacity for new records: a new key is refused
+// with ErrCapacity while the existing pair still restores and repeats.
+func TestProcessReadAtCapacity(t *testing.T) {
+	st := store.NewMemory(store.Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour, CreateWait: time.Second})
+	svc := New([]Recognizer{recognizer.EmailRecognizer{}}, st, masker.New("PII"))
+	ctx := context.Background()
+	original := "mail a@b.ru"
+	masked, err := svc.Process(ctx, "id-1", original)
+	if err != nil {
+		t.Fatalf("mask: %v", err)
+	}
+	// The store is at capacity; a new key is refused.
+	if _, err := svc.Process(ctx, "id-2", "c@d.io"); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("new key err = %v, want ErrCapacity", err)
+	}
+	// The stored pair still repeats the mask and restores the original.
+	rep, err := svc.Process(ctx, "id-1", original)
+	if err != nil || rep.Text != masked.Text {
+		t.Fatalf("repeat = %q, %v; want %q", rep.Text, err, masked.Text)
+	}
+	restored, err := svc.Process(ctx, "id-1", masked.Text)
+	if err != nil || restored.Text != original {
+		t.Fatalf("restore = %q, %v; want %q", restored.Text, err, original)
+	}
+}
+
 // TestProcessLostResponse verifies that if the client loses the response after
 // a successful mask, a retry with the original returns the saved mask.
 func TestProcessLostResponse(t *testing.T) {
@@ -671,7 +698,6 @@ func TestLateRestoreDoesNotCompleteNewRecord(t *testing.T) {
 	if _, err := svc.Process(ctx, "id-1", "mail c@d.io and e@f.gh"); err != nil {
 		t.Fatalf("new mask: %v", err)
 	}
-	newRec, _ := st.Get("process:id-1")
 	// A late restore of the old mask does not match the new record, so it is a
 	// conflict and must not transition the new record.
 	if _, err := svc.Process(ctx, "id-1", oldRes.Text); !errors.Is(err, ErrConflict) {
@@ -684,7 +710,6 @@ func TestLateRestoreDoesNotCompleteNewRecord(t *testing.T) {
 	if !r.FirstRestoreAt.IsZero() {
 		t.Fatal("new record must remain in pending phase after rejected late restore")
 	}
-	_ = newRec
 }
 
 // fakeClock is a controllable clock for TTL and replay-window tests. It is safe

@@ -86,7 +86,7 @@ func TestObserverRecordsCreationAndEviction(t *testing.T) {
 	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: 10 * time.Millisecond, CreateWait: time.Second})
 	s.SetObserver(obs)
 
-	if _, created, err := s.Create(context.Background(), "k", build(rec("orig", "mask"))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), "k", minSize("k", "orig"), build(rec("orig", "mask"))); err != nil || !created {
 		t.Fatalf("Create = created %v, err %v", created, err)
 	}
 	added, _, _, bytes, _ := obs.snapshot()
@@ -120,14 +120,14 @@ func TestObserverRecordsCapacityFailure(t *testing.T) {
 	s := NewMemory(Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour, CreateWait: time.Second})
 	s.SetObserver(obs)
 
-	if _, created, err := s.Create(context.Background(), "k1", build(rec("a", "m"))); err != nil || !created {
+	if _, created, err := s.Create(context.Background(), "k1", minSize("k1", "a"), build(rec("a", "m"))); err != nil || !created {
 		t.Fatalf("first Create = created %v, err %v", created, err)
 	}
-	if _, _, err := s.Create(context.Background(), "k2", build(rec("b", "n"))); err == nil {
+	if _, _, err := s.Create(context.Background(), "k2", minSize("k2", "b"), build(rec("b", "n"))); err == nil {
 		t.Fatal("second Create should fail at capacity")
 	}
 	_, _, _, _, failures := obs.snapshot()
-	if failures[StoreFailCapacity] != 1 {
-		t.Fatalf("capacity failures = %d, want 1", failures[StoreFailCapacity])
+	if failures[StoreFailEntries] != 1 {
+		t.Fatalf("entry failures = %d, want 1", failures[StoreFailEntries])
 	}
 }

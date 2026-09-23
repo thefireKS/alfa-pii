@@ -21,10 +21,16 @@ var ErrCapacity = errors.New("store capacity exceeded")
 // same key to publish its result.
 var ErrBusy = errors.New("store busy creating key")
 
-// Failure reasons reported to the observer.
+// Failure reasons reported to the observer. The set is fixed and bounded so
+// metrics labels stay limited. Capacity refusals are broken down by the limit
+// that was hit so diagnostics can tell an entry limit from a byte budget or a
+// single-record limit apart.
 const (
-	StoreFailCapacity = "capacity"
-	StoreFailBusy     = "busy"
+	StoreFailCapacity    = "capacity"     // generic capacity refusal
+	StoreFailBusy        = "busy"         // wait for another creator timed out
+	StoreFailEntries     = "entries"      // entry limit reached
+	StoreFailBytes       = "bytes"        // total byte budget reached
+	StoreFailRecordBytes = "record_bytes" // single record exceeds its limit
 )
 
 // Phases of a stored correspondence. A record is created in the pending phase
@@ -90,7 +96,16 @@ type Store interface {
 	// waiter never repeats the expensive recognition work. If the store is at
 	// capacity, ErrCapacity is returned; if the wait times out, ErrBusy is
 	// returned.
-	Create(ctx context.Context, key string, build func(context.Context) (Record, error)) (Record, bool, error)
+	//
+	// minSize is the justified lower bound of the record's memory footprint
+	// known before recognition (the held key and the original text). The store
+	// reserves minSize plus the inflight overhead against the same MaxBytes and
+	// MaxEntries budget as stored records before running build, so concurrent
+	// creators for different keys cannot collectively exceed the budget and a
+	// request that cannot possibly fit is rejected before the expensive
+	// recognition runs. The real size is checked after build; if it does not
+	// fit, the reservation is released and ErrCapacity is returned.
+	Create(ctx context.Context, key string, minSize int64, build func(context.Context) (Record, error)) (Record, bool, error)
 	// MarkRestored transitions the record for key from the pending phase to the
 	// replay phase, extending its lifetime to FirstRestoreAt + ReplayTTL. It
 	// returns true only if the transition happened: the record exists, its
@@ -132,6 +147,23 @@ const recordOverhead = 128
 
 // replacementOverhead approximates the per-replacement slice element cost.
 const replacementOverhead = 32
+
+// inflightOverhead approximates the memory held by one active reservation: the
+// inflight struct, its done channel and the key string in the inflight map. It
+// is reserved alongside the record's lower bound so concurrent creators for
+// different keys cannot collectively exceed the byte budget with their
+// coordination state.
+const inflightOverhead = 64
+
+// MinRecordSize returns the justified lower bound of a record's memory
+// footprint known before recognition: the fixed overhead, the held key and the
+// original text. The masked text and replacement table are not known yet, so
+// they are not counted; the real size is checked after build. The caller
+// supplies the original length because the store does not see the payload
+// before build runs.
+func MinRecordSize(key string, originalLen int) int64 {
+	return int64(recordOverhead + len(key) + originalLen)
+}
 
 // inflight is a per-key reservation. The winning creator publishes its result
 // through done; waiters block on done and read rec/err.
@@ -231,6 +263,15 @@ type Memory struct {
 	obs      Observer
 	nextVer  uint64
 
+	// reservedBytes and reservedEntries account for capacity held by active
+	// creators that have not yet published. They share the same MaxBytes and
+	// MaxEntries budget as stored records, so concurrent creators for different
+	// keys cannot collectively exceed the budget. A reservation is released
+	// exactly once on every outcome: publish, build error, cancellation or a
+	// post-build capacity refusal.
+	reservedBytes   int64
+	reservedEntries int
+
 	stopCh  chan struct{}
 	doneCh  chan struct{}
 	started bool
@@ -310,7 +351,15 @@ func (s *Memory) recordExpiry(rec Record) time.Time {
 // the same key yield the same winning record. The global mutex is not held
 // while build runs, so different keys are processed independently and a large
 // recognition does not block unrelated keys.
-func (s *Memory) Create(ctx context.Context, key string, build func(context.Context) (Record, error)) (Record, bool, error) {
+//
+// Before build runs, the store reserves minSize plus the inflight overhead
+// against the shared MaxBytes and MaxEntries budget. This rejects a request
+// that cannot possibly fit before the expensive recognition is paid, and it
+// prevents concurrent creators for different keys from collectively exceeding
+// the budget. After build the real size is checked; a refusal, a build error or
+// a cancellation releases the reservation exactly once.
+func (s *Memory) Create(ctx context.Context, key string, minSize int64, build func(context.Context) (Record, error)) (Record, bool, error) {
+	reserve := minSize + inflightOverhead
 	for {
 		if err := ctx.Err(); err != nil {
 			return Record{}, false, err
@@ -338,30 +387,37 @@ func (s *Memory) Create(ctx context.Context, key string, build func(context.Cont
 				return Record{}, false, err
 			}
 			if created {
-				// The previous creator failed or was cancelled without
-				// publishing; retry and become the creator ourselves.
+				// The previous creator was cancelled by its own context without
+				// publishing; retry and become the creator ourselves. A
+				// persistent error is returned to the waiter instead, so the
+				// expensive recognition is not repeated for a failure that will
+				// not change.
 				continue
 			}
 			return rec, false, nil
 		}
-		// Become the creator for this key.
+		// Become the creator for this key. The reservation is taken under the
+		// same lock that publishes the inflight entry, so no other goroutine
+		// can observe the reservation before it is fully accounted.
 		inf := &inflight{done: make(chan struct{})}
 		s.inflight[key] = inf
-		s.mu.Unlock()
 
-		// Reject before running build when the store is already at capacity, so
-		// an expensive recognition is not paid for a request that cannot be
-		// stored. A bounded batch of expired records is drained first so a full
-		// store that only holds expired correspondences can accept new ones; the
-		// drain never walks the whole backlog under the mutex. The per-record
-		// size is still checked after build.
-		s.mu.Lock()
+		// Reject before running build when the store cannot hold even the
+		// lower bound of the record, so an expensive recognition is not paid
+		// for a request that cannot be stored. A bounded batch of expired
+		// records is drained first so a full store that only holds expired
+		// correspondences can accept new ones; the drain never walks the whole
+		// backlog under the mutex. The per-record size is still checked after
+		// build.
 		ev := s.drainExpired()
-		if len(s.entries) >= s.limits.MaxEntries || s.bytes >= s.limits.MaxBytes {
+		if reason := s.reserveCapacityLocked(reserve); reason != "" {
+			// No waiter can have observed the inflight entry yet because the
+			// lock was held throughout, so the entry is removed without waking
+			// anyone.
+			delete(s.inflight, key)
 			s.mu.Unlock()
 			s.flushEvents(ev)
-			s.finishInflight(key, inf, Record{}, ErrCapacity)
-			s.reportFailure(StoreFailCapacity)
+			s.reportFailure(reason)
 			return Record{}, false, ErrCapacity
 		}
 		s.mu.Unlock()
@@ -369,11 +425,11 @@ func (s *Memory) Create(ctx context.Context, key string, build func(context.Cont
 
 		rec, err := build(ctx)
 		if err != nil {
-			s.finishInflight(key, inf, Record{}, err)
+			s.failInflight(key, inf, reserve, err)
 			return Record{}, false, err
 		}
 		if cerr := ctx.Err(); cerr != nil {
-			s.finishInflight(key, inf, Record{}, cerr)
+			s.failInflight(key, inf, reserve, cerr)
 			return Record{}, false, cerr
 		}
 
@@ -382,13 +438,19 @@ func (s *Memory) Create(ctx context.Context, key string, build func(context.Cont
 		rec.CreatedAt = s.now()
 		rec.size = recordSize(key, rec)
 		size := rec.size
-		if size > s.limits.MaxRecordBytes || s.bytes+size > s.limits.MaxBytes || len(s.entries) >= s.limits.MaxEntries {
+		if reason := s.publishCapacityLocked(size, reserve); reason != "" {
+			s.releaseReservationLocked(key, inf, reserve)
 			s.mu.Unlock()
 			s.flushEvents(ev)
 			s.finishInflight(key, inf, Record{}, ErrCapacity)
-			s.reportFailure(StoreFailCapacity)
+			s.reportFailure(reason)
 			return Record{}, false, ErrCapacity
 		}
+		// Publish: atomically replace the reservation with the stored record.
+		// The entry slot and the reserved bytes are converted into the record,
+		// so the shared budget is unchanged by the transition.
+		s.reservedBytes -= reserve
+		s.reservedEntries--
 		s.nextVer++
 		rec.Version = s.nextVer
 		s.entries[key] = rec
@@ -404,9 +466,53 @@ func (s *Memory) Create(ctx context.Context, key string, build func(context.Cont
 	}
 }
 
+// reserveCapacityLocked attempts to reserve reserve bytes and one entry slot
+// against the shared budget. It returns the failure reason on refusal, or ""
+// on success. It must be called with the mutex held.
+func (s *Memory) reserveCapacityLocked(reserve int64) string {
+	if s.limits.MaxEntries > 0 && len(s.entries)+s.reservedEntries >= s.limits.MaxEntries {
+		return StoreFailEntries
+	}
+	if s.limits.MaxBytes > 0 && s.bytes+s.reservedBytes+reserve > s.limits.MaxBytes {
+		return StoreFailBytes
+	}
+	s.reservedBytes += reserve
+	s.reservedEntries++
+	return ""
+}
+
+// publishCapacityLocked checks whether the real record size fits after the
+// reservation is replaced by the stored record. It returns the failure reason
+// on refusal, or "" on success. The entry slot is already held by the
+// reservation, so only the per-record and byte limits are re-checked. It must
+// be called with the mutex held.
+func (s *Memory) publishCapacityLocked(size, reserve int64) string {
+	if s.limits.MaxRecordBytes > 0 && size > s.limits.MaxRecordBytes {
+		return StoreFailRecordBytes
+	}
+	if s.limits.MaxBytes > 0 && s.bytes+s.reservedBytes-reserve+size > s.limits.MaxBytes {
+		return StoreFailBytes
+	}
+	return ""
+}
+
+// releaseReservationLocked returns the reservation to the shared budget. It
+// must be called with the mutex held and only for a reservation that was
+// actually taken.
+func (s *Memory) releaseReservationLocked(key string, inf *inflight, reserve int64) {
+	if s.inflight[key] == inf {
+		delete(s.inflight, key)
+	}
+	s.reservedBytes -= reserve
+	s.reservedEntries--
+}
+
 // waitInflight blocks until the creator publishes or fails, bounded by ctx and
-// the store's CreateWait. It returns created=true when the creator released the
-// reservation without publishing, so the caller should retry.
+// the store's CreateWait. It returns created=true when the creator was cancelled
+// by its own context without publishing, so a waiter with a still-live context
+// should retry and become the creator itself. A persistent error (a build
+// failure or a capacity refusal) is returned to every waiter unchanged, so the
+// expensive recognition is not repeated for a failure that will not change.
 func (s *Memory) waitInflight(ctx context.Context, inf *inflight) (Record, bool, error) {
 	var timer *time.Timer
 	var timeout <-chan time.Time
@@ -418,7 +524,14 @@ func (s *Memory) waitInflight(ctx context.Context, inf *inflight) (Record, bool,
 	select {
 	case <-inf.done:
 		if inf.err != nil {
-			return Record{}, true, nil
+			if isContextError(inf.err) {
+				// The creator was cancelled by its own context; a waiter with a
+				// live context may retry creation. A waiter whose own context is
+				// cancelled returns its own context error at the top of the
+				// Create loop.
+				return Record{}, true, nil
+			}
+			return Record{}, false, inf.err
 		}
 		return inf.rec, false, nil
 	case <-ctx.Done():
@@ -429,7 +542,30 @@ func (s *Memory) waitInflight(ctx context.Context, inf *inflight) (Record, bool,
 	}
 }
 
+// isContextError reports whether err is a context cancellation or deadline
+// exceeded. It is used to tell a creator cancelled by its own context apart
+// from a persistent build or capacity error, so waiters only retry creation
+// when the failure is transient.
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// failInflight releases the reservation and wakes all waiters with the error.
+// It is used for a build error, a cancellation after build, or a post-build
+// capacity refusal. The reservation is released exactly once.
+func (s *Memory) failInflight(key string, inf *inflight, reserve int64, err error) {
+	s.mu.Lock()
+	s.releaseReservationLocked(key, inf, reserve)
+	inf.rec = Record{}
+	inf.err = err
+	close(inf.done)
+	s.mu.Unlock()
+}
+
 // finishInflight removes the reservation and wakes all waiters with the result.
+// It is used on the publish path, where the reservation was already replaced by
+// the stored record in the publish critical section, so no reservation is
+// released here.
 func (s *Memory) finishInflight(key string, inf *inflight, rec Record, err error) {
 	s.mu.Lock()
 	if s.inflight[key] == inf {
@@ -460,9 +596,9 @@ func (s *Memory) MarkRestored(key string, version uint64) bool {
 	rec.FirstRestoreAt = s.now()
 	s.entries[key] = rec
 	s.expiries.remove(key)
-	if s.limits.ReplayTTL > 0 {
-		heap.Push(s.expiries, expiryNode{expiresAt: rec.FirstRestoreAt.Add(s.limits.ReplayTTL), key: key})
-	}
+	// ReplayTTL is positive here (the guard above rejects ReplayTTL <= 0), so
+	// the replay expiry node is always pushed.
+	heap.Push(s.expiries, expiryNode{expiresAt: rec.FirstRestoreAt.Add(s.limits.ReplayTTL), key: key})
 	ev := pendingEvents{
 		removedPending: 1,
 		bytesPending:   -rec.size,
