@@ -6,6 +6,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -29,6 +30,15 @@ import (
 type processRequest struct {
 	Payload   string `json:"payload"`
 	PayloadID string `json:"payload_id"`
+}
+
+// rawRequest mirrors processRequest but keeps the field values as raw JSON so
+// the decoder can distinguish a missing field from an empty string and reject
+// non-string values (null, numbers, arrays, objects) before the application
+// layer is reached.
+type rawRequest struct {
+	Payload   json.RawMessage `json:"payload"`
+	PayloadID json.RawMessage `json:"payload_id"`
 }
 
 // processResponse is the success body for the process, mask and restore
@@ -254,10 +264,10 @@ func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) (string, 
 func (h *Handler) decodeRequest(w http.ResponseWriter, r *http.Request) (processRequest, string, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, h.maxBody)
 
-	var req processRequest
+	var raw rawRequest
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	if err := dec.Decode(&raw); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
@@ -271,11 +281,39 @@ func (h *Handler) decodeRequest(w http.ResponseWriter, r *http.Request) (process
 		writeError(w, http.StatusBadRequest, "request body must be a single JSON object")
 		return processRequest{}, metrics.OutcomeInvalid, false
 	}
-	if req.PayloadID == "" {
+
+	payload, ok := decodeStringField(raw.Payload)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "payload must be a non-null string")
+		return processRequest{}, metrics.OutcomeInvalid, false
+	}
+	payloadID, ok := decodeStringField(raw.PayloadID)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "payload_id must be a non-null string")
+		return processRequest{}, metrics.OutcomeInvalid, false
+	}
+	if payloadID == "" {
 		writeError(w, http.StatusBadRequest, "payload_id must not be empty")
 		return processRequest{}, metrics.OutcomeInvalid, false
 	}
-	return req, "", true
+	return processRequest{Payload: payload, PayloadID: payloadID}, "", true
+}
+
+// decodeStringField converts a raw JSON field value into a string. It reports
+// false when the field is missing, is the JSON null literal, or is not a JSON
+// string (number, array, object, boolean). An empty string is a valid value.
+func decodeStringField(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
 }
 
 // outcomeForError maps an application error to a metrics outcome and duration

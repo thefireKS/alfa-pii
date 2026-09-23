@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -317,5 +318,109 @@ func TestErrorBodyDoesNotLeakPayload(t *testing.T) {
 	rec := doPost(t, h, `{"payload":"`+secret+`","payload_id":123}`)
 	if bytes.Contains(rec.Body.Bytes(), []byte(secret)) {
 		t.Fatalf("error body leaked payload: %q", rec.Body.String())
+	}
+}
+
+// spyService records whether the application layer was reached and returns a
+// fixed result. It is used to prove that invalid requests never reach the
+// application layer.
+type spyService struct {
+	called bool
+}
+
+func (s *spyService) Process(ctx context.Context, payloadID, payload string) (app.Result, error) {
+	s.called = true
+	return app.Result{Text: payload, Outcome: app.OutcomeMask}, nil
+}
+
+func (s *spyService) Mask(ctx context.Context, consumerName, payloadID, payload string) (app.Result, error) {
+	s.called = true
+	return app.Result{Text: payload, Outcome: app.OutcomeMask}, nil
+}
+
+func (s *spyService) Restore(ctx context.Context, consumerName, payloadID, masked string) (app.Result, error) {
+	s.called = true
+	return app.Result{Text: masked, Outcome: app.OutcomeRestore}, nil
+}
+
+// TestProcessRequestValidation is a table-driven check that the shared request
+// decoder rejects missing, null and non-string fields, empty payload_id,
+// corrupted JSON and oversized bodies, while accepting an empty payload string.
+// Each invalid request must return a safe 4xx without reaching the application
+// layer and without creating a correspondence.
+func TestProcessRequestValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{name: "missing payload", body: `{"payload_id":"id"}`, want: http.StatusBadRequest},
+		{name: "missing payload_id", body: `{"payload":"x"}`, want: http.StatusBadRequest},
+		{name: "null payload", body: `{"payload":null,"payload_id":"id"}`, want: http.StatusBadRequest},
+		{name: "null payload_id", body: `{"payload":"x","payload_id":null}`, want: http.StatusBadRequest},
+		{name: "number payload", body: `{"payload":123,"payload_id":"id"}`, want: http.StatusBadRequest},
+		{name: "number payload_id", body: `{"payload":"x","payload_id":5}`, want: http.StatusBadRequest},
+		{name: "array payload", body: `{"payload":[1],"payload_id":"id"}`, want: http.StatusBadRequest},
+		{name: "array payload_id", body: `{"payload":"x","payload_id":["a"]}`, want: http.StatusBadRequest},
+		{name: "object payload", body: `{"payload":{"a":1},"payload_id":"id"}`, want: http.StatusBadRequest},
+		{name: "object payload_id", body: `{"payload":"x","payload_id":{"a":1}}`, want: http.StatusBadRequest},
+		{name: "bool payload", body: `{"payload":true,"payload_id":"id"}`, want: http.StatusBadRequest},
+		{name: "empty payload_id", body: `{"payload":"x","payload_id":""}`, want: http.StatusBadRequest},
+		{name: "unknown field", body: `{"payload":"x","payload_id":"id","extra":1}`, want: http.StatusBadRequest},
+		{name: "corrupted json", body: `{"payload":"x","payload_id":"id"`, want: http.StatusBadRequest},
+		{name: "not json", body: `not json`, want: http.StatusBadRequest},
+		{name: "array not object", body: `[1,2]`, want: http.StatusBadRequest},
+		{name: "trailing data", body: `{"payload":"x","payload_id":"id"} {}`, want: http.StatusBadRequest},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			svc := &spyService{}
+			h := NewHandler(svc, nil, func() bool { return true }, 10, 1<<20, nil, nil)
+			rec := doPost(t, h, c.body)
+			if rec.Code != c.want {
+				t.Fatalf("status = %d, want %d; body=%q", rec.Code, c.want, rec.Body.String())
+			}
+			if svc.called {
+				t.Fatalf("application layer was called for invalid request %q", c.body)
+			}
+			var e errorResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+				t.Fatalf("error body not JSON: %q", rec.Body.String())
+			}
+			if e.Error == "" {
+				t.Fatalf("error message empty: %q", rec.Body.String())
+			}
+			if bytes.Contains(rec.Body.Bytes(), []byte("x")) {
+				t.Fatalf("error body echoed request content: %q", rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestProcessRequestValidationTooLarge verifies that an oversized body is
+// rejected with 413 before the application layer is reached.
+func TestProcessRequestValidationTooLarge(t *testing.T) {
+	svc := &spyService{}
+	h := NewHandler(svc, nil, func() bool { return true }, 10, 16, nil, nil)
+	big := strings.Repeat("a", 64)
+	rec := doPost(t, h, `{"payload":"`+big+`","payload_id":"id-big"}`)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body=%q", rec.Code, rec.Body.String())
+	}
+	if svc.called {
+		t.Fatal("application layer was called for oversized body")
+	}
+}
+
+// TestProcessEmptyPayloadValid verifies that an empty payload string is a valid
+// request and is processed successfully.
+func TestProcessEmptyPayloadValid(t *testing.T) {
+	h := newTestHandler(10, 1<<20)
+	rec := doPost(t, h, `{"payload":"","payload_id":"empty"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := decodeResult(t, rec); got != "" {
+		t.Fatalf("result = %q, want empty", got)
 	}
 }
