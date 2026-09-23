@@ -28,29 +28,30 @@ import (
 
 func main() {
 	var (
-		base       = flag.String("base", "http://127.0.0.1:8080", "service base URL")
-		mode       = flag.String("mode", "sequential", "scenario mode: sequential|mask_dominant|restore_dominant")
-		duration   = flag.Duration("duration", 5*time.Minute, "run duration")
-		target     = flag.Float64("target", 330, "target RPS")
-		peak       = flag.Float64("peak", 1000, "peak RPS during ramp")
-		ramp       = flag.Duration("ramp", 60*time.Second, "ramp-up duration")
-		burstEvery = flag.Duration("burst-every", 0, "interval between bursts (0 disables bursts)")
-		burstDur   = flag.Duration("burst-duration", 0, "duration of each burst")
-		workers    = flag.Int("workers", 200, "concurrent connections")
-		seed       = flag.Int64("seed", loadgen.DefaultSeed, "generator seed")
-		outDir     = flag.String("out", ".artifacts", "output directory")
-		container  = flag.String("container", "pii-service", "container name for docker stats")
-		prep       = flag.Int("prep", 0, "preparation count for restore_dominant")
-		restoreFrac = flag.Float64("restore-fraction", 0.5, "fraction of restore steps")
+		base          = flag.String("base", "http://127.0.0.1:8080", "service base URL")
+		mode          = flag.String("mode", "sequential", "scenario mode: sequential|mask_dominant|restore_dominant")
+		duration      = flag.Duration("duration", 5*time.Minute, "run duration")
+		target        = flag.Float64("target", 330, "target RPS")
+		peak          = flag.Float64("peak", 1000, "peak RPS during ramp")
+		ramp          = flag.Duration("ramp", 60*time.Second, "ramp-up duration")
+		burstEvery    = flag.Duration("burst-every", 0, "interval between bursts (0 disables bursts)")
+		burstDur      = flag.Duration("burst-duration", 0, "duration of each burst")
+		workers       = flag.Int("workers", 200, "concurrent connections")
+		seed          = flag.Int64("seed", loadgen.DefaultSeed, "generator seed")
+		outDir        = flag.String("out", ".artifacts", "output directory")
+		container     = flag.String("container", "pii-service", "container name for docker stats")
+		prep          = flag.Int("prep", 0, "preparation count for restore_dominant")
+		restoreFrac   = flag.Float64("restore-fraction", 0.5, "fraction of restore steps")
 		restoreBudget = flag.Int("restore-budget", 1, "max restores per pair in restore_dominant")
-		totalPairs = flag.Int("pairs", 100000, "total distinct payload_ids")
-		small      = flag.Int("small", 120, "small payload size in chars")
-		medium     = flag.Int("medium", 400, "medium payload size in chars")
-		large      = flag.Int("large", 2000, "large payload size in chars")
-		largeText  = flag.Bool("large-text", false, "run the large-text scenario")
-		scheduled  = flag.Bool("scheduled", false, "run the scheduled send mode")
-		compat     = flag.Bool("compat", false, "run the compatibility check")
-		queue      = flag.Int("queue", 64, "pacer/scheduler queue size")
+		totalPairs    = flag.Int("pairs", 100000, "total distinct payload_ids")
+		small         = flag.Int("small", 120, "small payload size in chars")
+		medium        = flag.Int("medium", 400, "medium payload size in chars")
+		large         = flag.Int("large", 2000, "large payload size in chars")
+		largeText     = flag.Bool("large-text", false, "run the large-text scenario")
+		scheduled     = flag.Bool("scheduled", false, "run the scheduled send mode")
+		compat        = flag.Bool("compat", false, "run the compatibility check")
+		queue         = flag.Int("queue", 64, "pacer/scheduler queue size")
+		prepTimeout   = flag.Duration("prep-timeout", 10*time.Minute, "timeout for the restore_dominant preparation phase")
 	)
 	flag.Parse()
 
@@ -77,15 +78,18 @@ func main() {
 		return
 	}
 
-	runMain(ctx, client, poller, loadgen.Mode(*mode), *base, *outDir, *seed,
+	runMain(client, poller, loadgen.Mode(*mode), *base, *outDir, *seed,
 		*target, *peak, *ramp, *burstEvery, *burstDur, *workers, *queue, *prep, *restoreFrac, *restoreBudget,
-		*totalPairs, *small, *medium, *large)
+		*totalPairs, *small, *medium, *large, *duration, *prepTimeout)
 }
 
-// runMain runs the main load profile.
-func runMain(ctx context.Context, client *loadgen.Client, poller *loadgen.MetricsPoller,
+// runMain runs the main load profile. The preparation phase (restore_dominant)
+// uses its own context and is excluded from the measured interval, so the
+// reported duration covers only the measured part.
+func runMain(client *loadgen.Client, poller *loadgen.MetricsPoller,
 	mode loadgen.Mode, base, outDir string, seed int64, target, peak float64, ramp, burstEvery, burstDur time.Duration,
-	workers, queue, prep int, restoreFrac float64, restoreBudget, totalPairs, small, medium, large int) {
+	workers, queue, prep int, restoreFrac float64, restoreBudget, totalPairs, small, medium, large int,
+	duration, prepTimeout time.Duration) {
 
 	gen := loadgen.NewTextGenerator(seed, loadgen.DefaultSizeProfile(), small, medium, large)
 	cfg := loadgen.ScenarioConfig{
@@ -94,13 +98,23 @@ func runMain(ctx context.Context, client *loadgen.Client, poller *loadgen.Metric
 		RestoreFraction: restoreFrac,
 		RestoreBudget:   restoreBudget,
 		Seed:            seed,
+		RunID:           newRunID(),
 	}
 
 	scenario := loadgen.NewScenario(cfg, gen)
 	var prepNote string
 	if mode == loadgen.ModeRestoreDominant {
-		prepNote = runPreparation(ctx, client, scenario, gen, prep, restoreBudget)
+		// Preparation runs in its own context so its cost is never attributed
+		// to the measured interval.
+		prepCtx, prepCancel := context.WithTimeout(context.Background(), prepTimeout)
+		prepNote = runPreparation(prepCtx, client, scenario, gen, prep, restoreBudget, cfg.RunID)
+		prepCancel()
 	}
+
+	// The measured interval starts after preparation completes.
+	runCtx, runCancel := context.WithTimeout(context.Background(), duration)
+	defer runCancel()
+
 	pacer := loadgen.NewPacer(loadgen.PacerConfig{
 		Target:        target,
 		Peak:          peak,
@@ -117,8 +131,9 @@ func runMain(ctx context.Context, client *loadgen.Client, poller *loadgen.Metric
 		MaxConsecutiveInvalid: 5,
 	})
 
-	// Poll metrics periodically during the run.
-	pollCtx, pollCancel := context.WithCancel(context.Background())
+	// Poll metrics periodically during the run. The poller context is derived
+	// from the run context so it stops when the run stops early.
+	pollCtx, pollCancel := context.WithCancel(runCtx)
 	defer pollCancel()
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
@@ -134,8 +149,9 @@ func runMain(ctx context.Context, client *loadgen.Client, poller *loadgen.Metric
 	}()
 
 	start := time.Now()
-	stopReason := runner.Run(ctx)
-	duration := time.Since(start)
+	stopReason := runner.Run(runCtx)
+	duration = time.Since(start)
+	pollCancel()
 	poller.Poll(context.Background())
 
 	granted, consumed, skipped := pacer.Counts()
@@ -143,35 +159,35 @@ func runMain(ctx context.Context, client *loadgen.Client, poller *loadgen.Metric
 	sm, peakCPU, peakRSS := poller.Snapshot()
 
 	rep := &loadgen.Report{
-		Title:           "Main load profile",
-		Mode:            mode,
-		Seed:            seed,
-		Duration:        duration,
-		TargetRPS:       target,
-		Granted:         granted,
-		Consumed:        consumed,
-		Skipped:         skipped,
-		Sent:            sent,
-		MaskSuccess:     maskSuccess,
-		RestoreSuccess:  restoreSuccess,
-		RestoreMismatch: restoreMismatch,
-		MaskNoChange:    maskNoChange,
-		StopReason:      stopReason,
-		Stats:           runner.Stats(),
-		LatencyByClass:  runner.Stats().LatencyByClass(),
-		OpLatency:       runner.Stats().OpLatency(),
-		ActualRPS:       rps(sent, duration),
-		SuccessRPS:      rps(maskSuccess+restoreSuccess, duration),
+		Title:            "Main load profile",
+		Mode:             mode,
+		Seed:             seed,
+		Duration:         duration,
+		TargetRPS:        target,
+		Granted:          granted,
+		Consumed:         consumed,
+		Skipped:          skipped,
+		Sent:             sent,
+		MaskSuccess:      maskSuccess,
+		RestoreSuccess:   restoreSuccess,
+		RestoreMismatch:  restoreMismatch,
+		MaskNoChange:     maskNoChange,
+		StopReason:       stopReason,
+		Stats:            runner.Stats(),
+		LatencyByClass:   runner.Stats().LatencyByClass(),
+		OpLatency:        runner.Stats().OpLatency(),
+		ActualRPS:        rps(sent, duration),
+		SuccessRPS:       rps(maskSuccess+restoreSuccess, duration),
 		OverloadFraction: fraction(runner.Stats().OutcomeCount(loadgen.OutcomeOverload), sent),
-		Pending:         scenario.Pending(),
-		StoreRecords:    sm.StoreRecords,
-		StoreBytes:      sm.StoreBytes,
-		CPUPercent:      peakCPU,
-		RSSBytes:        peakRSS,
-		ContainerLimits: loadgen.ContainerLimits(containerName()),
-		SizeProfile:     fmt.Sprintf("small=%d medium=%d large=%d", small, medium, large),
-		OpFraction:      fmt.Sprintf("restore_fraction=%.2f", restoreFrac),
-		Preparation:     prepNote,
+		Pending:          scenario.Pending(),
+		StoreRecords:     sm.StoreRecords,
+		StoreBytes:       sm.StoreBytes,
+		CPUPercent:       peakCPU,
+		RSSBytes:         peakRSS,
+		ContainerLimits:  loadgen.ContainerLimits(containerName()),
+		SizeProfile:      fmt.Sprintf("small=%d medium=%d large=%d", small, medium, large),
+		OpFraction:       fmt.Sprintf("restore_fraction=%.2f", restoreFrac),
+		Preparation:      prepNote,
 		Notes: []string{
 			"Token estimate is runes/4 (no exact tokenizer); sizes are in bytes and chars.",
 			"Generator memory is separate from service memory; inputs are pre-generated.",
@@ -186,8 +202,9 @@ func runMain(ctx context.Context, client *loadgen.Client, poller *loadgen.Metric
 
 // runPreparation creates the pre-created set for restore_dominant. It returns a
 // description of the preparation cost and size. Each successfully created
-// correspondence is registered in the scenario so it can be restored later.
-func runPreparation(ctx context.Context, client *loadgen.Client, scenario loadgen.Scenario, gen *loadgen.TextGenerator, count, budget int) string {
+// correspondence is registered in the scenario together with its payload_id so
+// it can be restored later under the exact ID.
+func runPreparation(ctx context.Context, client *loadgen.Client, scenario loadgen.Scenario, gen *loadgen.TextGenerator, count, budget int, runID string) string {
 	if count <= 0 {
 		return "no preparation (restore_dominant with no pre-created set)"
 	}
@@ -200,10 +217,10 @@ func runPreparation(ctx context.Context, client *loadgen.Client, scenario loadge
 	var bytes int64
 	for i := 0; i < count; i++ {
 		text, _ := gen.Next()
-		id := "prep-" + itoa(i)
+		id := prepID(runID, i)
 		resp, _ := client.SendWithRetry(ctx, id, text, loadgen.DefaultRetryPolicy())
 		if resp.IsValidSuccess() && resp.Result != text {
-			prepared.AddPrepared(text, resp.Result, budget)
+			prepared.AddPrepared(id, text, resp.Result, budget)
 			success++
 			bytes += int64(len(text))
 		}
@@ -342,15 +359,21 @@ func runScheduled(ctx context.Context, client *loadgen.Client, poller *loadgen.M
 		TotalPairs:      totalPairs,
 		RestoreFraction: restoreFrac,
 		Seed:            seed,
+		RunID:           newRunID(),
 	}, gen)
 	sched := loadgen.NewScheduler(client, scenario, loadgen.SchedulerConfig{
-		Target:  target,
-		Workers: workers,
-		Queue:   queue,
-		Retry:   loadgen.DefaultRetryPolicy(),
+		Target:                target,
+		Workers:               workers,
+		Queue:                 queue,
+		Retry:                 loadgen.DefaultRetryPolicy(),
+		MaxConsecutiveInvalid: 5,
 	})
 
-	pollCtx, pollCancel := context.WithCancel(context.Background())
+	// The poller context is derived from the run context so it stops when the
+	// scheduler stops early.
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	pollCtx, pollCancel := context.WithCancel(runCtx)
 	defer pollCancel()
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
@@ -366,43 +389,44 @@ func runScheduled(ctx context.Context, client *loadgen.Client, poller *loadgen.M
 	}()
 
 	start := time.Now()
-	stopReason := sched.Run(ctx)
+	stopReason := sched.Run(runCtx)
 	duration := time.Since(start)
+	pollCancel()
 	poller.Poll(context.Background())
 
 	scheduled, sent, late, skipped, maskSuccess, restoreSuccess, restoreMismatch, maskNoChange := sched.Counts()
 	sm, peakCPU, peakRSS := poller.Snapshot()
 
 	rep := &loadgen.Report{
-		Title:           "Scheduled send mode",
-		Mode:            loadgen.ModeMaskDominant,
-		Seed:            seed,
-		Duration:        duration,
-		TargetRPS:       target,
-		Granted:         scheduled,
-		Consumed:        sent,
-		Skipped:         skipped,
-		Late:            late,
-		Sent:            sent,
-		MaskSuccess:     maskSuccess,
-		RestoreSuccess:  restoreSuccess,
-		RestoreMismatch: restoreMismatch,
-		MaskNoChange:    maskNoChange,
-		StopReason:      stopReason,
-		Stats:           sched.Stats(),
-		LatencyByClass:  sched.Stats().LatencyByClass(),
-		OpLatency:       sched.Stats().OpLatency(),
-		ActualRPS:       rps(sent, duration),
-		SuccessRPS:      rps(maskSuccess+restoreSuccess, duration),
+		Title:            "Scheduled send mode",
+		Mode:             loadgen.ModeMaskDominant,
+		Seed:             seed,
+		Duration:         duration,
+		TargetRPS:        target,
+		Granted:          scheduled,
+		Consumed:         sent,
+		Skipped:          skipped,
+		Late:             late,
+		Sent:             sent,
+		MaskSuccess:      maskSuccess,
+		RestoreSuccess:   restoreSuccess,
+		RestoreMismatch:  restoreMismatch,
+		MaskNoChange:     maskNoChange,
+		StopReason:       stopReason,
+		Stats:            sched.Stats(),
+		LatencyByClass:   sched.Stats().LatencyByClass(),
+		OpLatency:        sched.Stats().OpLatency(),
+		ActualRPS:        rps(sent, duration),
+		SuccessRPS:       rps(maskSuccess+restoreSuccess, duration),
 		OverloadFraction: fraction(sched.Stats().OutcomeCount(loadgen.OutcomeOverload), sent),
-		Pending:         scenario.Pending(),
-		StoreRecords:    sm.StoreRecords,
-		StoreBytes:      sm.StoreBytes,
-		CPUPercent:      peakCPU,
-		RSSBytes:        peakRSS,
-		ContainerLimits: loadgen.ContainerLimits(containerName()),
-		SizeProfile:     fmt.Sprintf("small=%d medium=%d large=%d", small, medium, large),
-		OpFraction:      fmt.Sprintf("restore_fraction=%.2f", restoreFrac),
+		Pending:          scenario.Pending(),
+		StoreRecords:     sm.StoreRecords,
+		StoreBytes:       sm.StoreBytes,
+		CPUPercent:       peakCPU,
+		RSSBytes:         peakRSS,
+		ContainerLimits:  loadgen.ContainerLimits(containerName()),
+		SizeProfile:      fmt.Sprintf("small=%d medium=%d large=%d", small, medium, large),
+		OpFraction:       fmt.Sprintf("restore_fraction=%.2f", restoreFrac),
 		Notes: []string{
 			"Scheduled mode: fixed rate, bounded queue, late sends and skips visible.",
 			"Late count is not tracked per-slot; skips are queue-full drops.",
@@ -467,11 +491,11 @@ func writeReport(outDir, name string, rep *loadgen.Report) {
 
 func writeJSON(outDir, name string, rep *loadgen.Report) {
 	type jsonStats struct {
-		Count    int64                  `json:"count"`
+		Count    int64                     `json:"count"`
 		Outcomes map[loadgen.Outcome]int64 `json:"outcomes"`
-		Statuses map[int]int64          `json:"statuses"`
-		Bytes    int64                  `json:"bytes"`
-		Chars    int64                  `json:"chars"`
+		Statuses map[int]int64             `json:"statuses"`
+		Bytes    int64                     `json:"bytes"`
+		Chars    int64                     `json:"chars"`
 	}
 	type jsonLatency struct {
 		Mean string `json:"mean"`
@@ -480,67 +504,67 @@ func writeJSON(outDir, name string, rep *loadgen.Report) {
 		P99  string `json:"p99"`
 	}
 	type jsonReport struct {
-		Title           string     `json:"title"`
-		Mode            loadgen.Mode `json:"mode"`
-		Seed            int64      `json:"seed"`
-		Duration        string     `json:"duration"`
-		TargetRPS       float64    `json:"target_rps"`
-		Granted         int64      `json:"granted"`
-		Consumed        int64      `json:"consumed"`
-		Skipped         int64      `json:"skipped"`
-		Late            int64      `json:"late"`
-		Sent            int64      `json:"sent"`
-		MaskSuccess     int64      `json:"mask_success"`
-		RestoreSuccess  int64      `json:"restore_success"`
-		RestoreMismatch int64      `json:"restore_mismatch"`
-		MaskNoChange    int64      `json:"mask_no_change"`
-		StopReason      string     `json:"stop_reason"`
-		Pending         int        `json:"pending"`
-		StoreRecords    int64      `json:"store_records"`
-		StoreBytes      int64      `json:"store_bytes"`
-		CPUPercent      float64    `json:"cpu_percent"`
-		RSSBytes        int64      `json:"rss_bytes"`
-		ContainerLimits string     `json:"container_limits"`
-		SizeProfile     string     `json:"size_profile"`
-		OpFraction      string     `json:"op_fraction"`
-		Preparation     string     `json:"preparation"`
-		Notes           []string   `json:"notes"`
-		Stats           *jsonStats `json:"stats"`
-		Latency         *jsonLatency `json:"latency"`
-		LatencyByClass  map[loadgen.LatencyClass]*jsonLatency `json:"latency_by_class"`
-		OpLatency       *jsonLatency `json:"op_latency"`
-		ActualRPS       float64    `json:"actual_rps"`
-		SuccessRPS      float64    `json:"success_rps"`
-		OverloadFraction float64   `json:"overload_fraction"`
+		Title            string                                `json:"title"`
+		Mode             loadgen.Mode                          `json:"mode"`
+		Seed             int64                                 `json:"seed"`
+		Duration         string                                `json:"duration"`
+		TargetRPS        float64                               `json:"target_rps"`
+		Granted          int64                                 `json:"granted"`
+		Consumed         int64                                 `json:"consumed"`
+		Skipped          int64                                 `json:"skipped"`
+		Late             int64                                 `json:"late"`
+		Sent             int64                                 `json:"sent"`
+		MaskSuccess      int64                                 `json:"mask_success"`
+		RestoreSuccess   int64                                 `json:"restore_success"`
+		RestoreMismatch  int64                                 `json:"restore_mismatch"`
+		MaskNoChange     int64                                 `json:"mask_no_change"`
+		StopReason       string                                `json:"stop_reason"`
+		Pending          int                                   `json:"pending"`
+		StoreRecords     int64                                 `json:"store_records"`
+		StoreBytes       int64                                 `json:"store_bytes"`
+		CPUPercent       float64                               `json:"cpu_percent"`
+		RSSBytes         int64                                 `json:"rss_bytes"`
+		ContainerLimits  string                                `json:"container_limits"`
+		SizeProfile      string                                `json:"size_profile"`
+		OpFraction       string                                `json:"op_fraction"`
+		Preparation      string                                `json:"preparation"`
+		Notes            []string                              `json:"notes"`
+		Stats            *jsonStats                            `json:"stats"`
+		Latency          *jsonLatency                          `json:"latency"`
+		LatencyByClass   map[loadgen.LatencyClass]*jsonLatency `json:"latency_by_class"`
+		OpLatency        *jsonLatency                          `json:"op_latency"`
+		ActualRPS        float64                               `json:"actual_rps"`
+		SuccessRPS       float64                               `json:"success_rps"`
+		OverloadFraction float64                               `json:"overload_fraction"`
 	}
 	jr := &jsonReport{
-		Title:           rep.Title,
-		Mode:            rep.Mode,
-		Seed:            rep.Seed,
-		Duration:        rep.Duration.String(),
-		TargetRPS:       rep.TargetRPS,
-		Granted:         rep.Granted,
-		Consumed:        rep.Consumed,
-		Skipped:         rep.Skipped,
-		Late:            rep.Late,
-		Sent:            rep.Sent,
-		MaskSuccess:     rep.MaskSuccess,
-		RestoreSuccess:  rep.RestoreSuccess,
-		RestoreMismatch: rep.RestoreMismatch,
-		MaskNoChange:    rep.MaskNoChange,
-		StopReason:      rep.StopReason,
-		Pending:         rep.Pending,
-		StoreRecords:    rep.StoreRecords,
-		StoreBytes:      rep.StoreBytes,
-		CPUPercent:      rep.CPUPercent,
-		RSSBytes:        rep.RSSBytes,
-		ContainerLimits: rep.ContainerLimits,
-		SizeProfile:     rep.SizeProfile,
-		OpFraction:      rep.OpFraction,
-		Preparation:     rep.Preparation,
-		Notes:           rep.Notes,
-		ActualRPS:       rep.ActualRPS,
-		SuccessRPS:      rep.SuccessRPS,
+		Title:            rep.Title,
+		Mode:             rep.Mode,
+		Seed:             rep.Seed,
+		Duration:         rep.Duration.String(),
+		TargetRPS:        rep.TargetRPS,
+		Granted:          rep.Granted,
+		Consumed:         rep.Consumed,
+		Skipped:          rep.Skipped,
+		Late:             rep.Late,
+		Sent:             rep.Sent,
+		MaskSuccess:      rep.MaskSuccess,
+		RestoreSuccess:   rep.RestoreSuccess,
+		RestoreMismatch:  rep.RestoreMismatch,
+		MaskNoChange:     rep.MaskNoChange,
+		StopReason:       rep.StopReason,
+		Pending:          rep.Pending,
+		StoreRecords:     rep.StoreRecords,
+		StoreBytes:       rep.StoreBytes,
+		CPUPercent:       rep.CPUPercent,
+		RSSBytes:         rep.RSSBytes,
+		ContainerLimits:  rep.ContainerLimits,
+		SizeProfile:      rep.SizeProfile,
+		OpFraction:       rep.OpFraction,
+		Preparation:      rep.Preparation,
+		Notes:            rep.Notes,
+		ActualRPS:        rep.ActualRPS,
+		SuccessRPS:       rep.SuccessRPS,
 		OverloadFraction: rep.OverloadFraction,
 	}
 	if rep.Stats != nil {
@@ -603,6 +627,20 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b)
+}
+
+// prepID builds the payload_id used by the preparation phase for a prepared
+// pair. It must match the ID used when the correspondence was created.
+func prepID(runID string, i int) string {
+	return "prep-" + runID + "-" + itoa(i)
+}
+
+// newRunID returns a unique identifier for a load run. It is embedded in every
+// payload_id so a repeated run against a live service does not collide with
+// correspondences created by an earlier run. The seed is unaffected, so the
+// generated texts remain reproducible.
+func newRunID() string {
+	return strconv.FormatInt(time.Now().UnixNano(), 36)
 }
 
 // rps returns the rate of count events over the given duration.

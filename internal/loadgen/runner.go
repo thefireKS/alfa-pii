@@ -28,6 +28,11 @@ type Runner struct {
 	// stopReason is set when the runner stops early.
 	stopReason atomic.Value // string
 
+	// cancel cancels the run context when the compatibility check triggers, so
+	// every worker observes the stop and the whole run terminates, not just the
+	// worker that hit the threshold.
+	cancel context.CancelFunc
+
 	// maskSuccess and restoreSuccess count verified successful operations.
 	maskSuccess    int64
 	restoreSuccess int64
@@ -70,14 +75,18 @@ func NewRunner(client *Client, scenario Scenario, pacer *Pacer, cfg RunnerConfig
 
 // Run executes the load run until the context is done, the scenario is
 // exhausted, or the compatibility check stops it early. It returns the stop
-// reason.
+// reason. When the compatibility check triggers, the run context is cancelled
+// so every worker terminates together.
 func (r *Runner) Run(ctx context.Context) string {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	r.cancel = cancel
 	var wg sync.WaitGroup
 	for i := 0; i < r.workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r.worker(ctx)
+			r.worker(runCtx)
 		}()
 	}
 	wg.Wait()
@@ -106,6 +115,8 @@ func (r *Runner) worker(ctx context.Context) {
 		r.record(step, final, attempts, opLatency)
 		r.scenario.Complete(step, final)
 		if r.checkStop(final) {
+			// Cancel the run context so every worker stops, not just this one.
+			r.cancel()
 			return
 		}
 	}

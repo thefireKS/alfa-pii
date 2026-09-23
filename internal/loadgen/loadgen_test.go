@@ -171,11 +171,56 @@ func TestMaskDominantScenario(t *testing.T) {
 	}
 }
 
+// TestMaskDominantRestoreCompletesPair verifies that a successfully restored
+// pair is removed from the pending set so it is not selected again, while a
+// failed restore keeps the pair pending for a retry with the same ID and data.
+func TestMaskDominantRestoreCompletesPair(t *testing.T) {
+	gen := NewTextGenerator(1, DefaultSizeProfile(), 120, 400, 2000)
+	s := NewScenario(ScenarioConfig{Mode: ModeMaskDominant, TotalPairs: 10, RestoreFraction: 1.0, Seed: 1, RunID: "run"}, gen)
+	// Issue one mask step and complete it so the pair enters pending.
+	st, ok := s.Next()
+	if !ok || !st.IsMask {
+		t.Fatalf("expected mask step, got %+v ok=%v", st, ok)
+	}
+	s.Complete(st, Response{Status: 200, Outcome: OutcomeOK, Result: "mask" + st.PayloadID})
+	if s.Pending() != 1 {
+		t.Fatalf("pending=%d want 1", s.Pending())
+	}
+	// A failed restore (error) keeps the pair pending.
+	rst, ok := s.Next()
+	if !ok || rst.IsMask {
+		t.Fatalf("expected restore step, got %+v ok=%v", rst, ok)
+	}
+	s.Complete(rst, Response{Status: 500, Outcome: OutcomeError})
+	if s.Pending() != 1 {
+		t.Errorf("pending=%d want 1 after failed restore", s.Pending())
+	}
+	// A successful restore removes the pair from pending.
+	rst, ok = s.Next()
+	if !ok || rst.IsMask {
+		t.Fatalf("expected restore step, got %+v ok=%v", rst, ok)
+	}
+	s.Complete(rst, Response{Status: 200, Outcome: OutcomeOK, Result: rst.Original})
+	if s.Pending() != 0 {
+		t.Errorf("pending=%d want 0 after successful restore", s.Pending())
+	}
+	// The pair must not be selected again for restore.
+	for i := 0; i < 20; i++ {
+		st, ok := s.Next()
+		if !ok {
+			break
+		}
+		if !st.IsMask {
+			t.Fatalf("restore step issued for a completed pair: %+v", st)
+		}
+	}
+}
+
 func TestRestoreDominantScenarioBudget(t *testing.T) {
 	gen := NewTextGenerator(1, DefaultSizeProfile(), 120, 400, 2000)
-	s := NewScenario(ScenarioConfig{Mode: ModeRestoreDominant, TotalPairs: 0, RestoreFraction: 1.0, RestoreBudget: 2, Seed: 1}, gen)
+	s := NewScenario(ScenarioConfig{Mode: ModeRestoreDominant, TotalPairs: 0, RestoreFraction: 1.0, RestoreBudget: 2, Seed: 1, RunID: "run"}, gen)
 	rd := s.(*restoreDominant)
-	rd.AddPrepared("original0", "mask0", 2)
+	rd.AddPrepared("prep-run-0", "original0", "mask0", 2)
 	// With budget 2, exactly two restore steps for the pair.
 	for i := 0; i < 2; i++ {
 		st, ok := s.Next()
@@ -184,6 +229,9 @@ func TestRestoreDominantScenarioBudget(t *testing.T) {
 		}
 		if st.Payload != "mask0" {
 			t.Errorf("payload=%q want mask0", st.Payload)
+		}
+		if st.PayloadID != "prep-run-0" {
+			t.Errorf("payload_id=%q want prep-run-0", st.PayloadID)
 		}
 	}
 	// Budget exhausted; with no new pairs and no budget left, scenario ends.
@@ -532,5 +580,117 @@ func TestSchedulerRecordsRetrySeries(t *testing.T) {
 	}
 	if got := stats.OutcomeCount(OutcomeError); got != 1 {
 		t.Errorf("error count=%d want 1", got)
+	}
+}
+
+// TestSchedulerCompatibilityCheck verifies that five consecutive invalid
+// responses stop the whole scheduler run, not just one worker.
+func TestSchedulerCompatibilityCheck(t *testing.T) {
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+	})
+	client := NewClient(srv.URL, 10, time.Second)
+	gen := NewTextGenerator(1, DefaultSizeProfile(), 120, 400, 2000)
+	scenario := NewScenario(ScenarioConfig{Mode: ModeSequential, TotalPairs: 1000, Seed: 1, RunID: "run"}, gen)
+	sched := NewScheduler(client, scenario, SchedulerConfig{
+		Target:                1000,
+		Workers:               4,
+		Queue:                 16,
+		Retry:                 RetryPolicy{MaxAttempts: 1, BaseDelay: time.Millisecond},
+		MaxConsecutiveInvalid: 5,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	reason := sched.Run(ctx)
+	if reason != "five consecutive invalid responses" {
+		t.Errorf("stop reason=%q want compatibility stop", reason)
+	}
+}
+
+// TestSchedulerExhaustsWithoutTimeout verifies that when the scenario is
+// exhausted the scheduler finishes promptly instead of waiting for the overall
+// timeout.
+func TestSchedulerExhaustsWithoutTimeout(t *testing.T) {
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]string{"result": "masked"})
+	})
+	client := NewClient(srv.URL, 10, time.Second)
+	gen := NewTextGenerator(1, DefaultSizeProfile(), 120, 400, 2000)
+	scenario := NewScenario(ScenarioConfig{Mode: ModeSequential, TotalPairs: 3, Seed: 1, RunID: "run"}, gen)
+	sched := NewScheduler(client, scenario, SchedulerConfig{
+		Target:                1000,
+		Workers:               2,
+		Queue:                 4,
+		Retry:                 RetryPolicy{MaxAttempts: 1, BaseDelay: time.Millisecond},
+		MaxConsecutiveInvalid: 5,
+	})
+	// A long timeout that would mask a hang; the run must finish well before it.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	reason := sched.Run(ctx)
+	if reason != "scenario exhausted" {
+		t.Errorf("stop reason=%q want scenario exhausted", reason)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("scheduler took %s to exhaust, expected prompt finish", elapsed)
+	}
+}
+
+// TestRestoreDominantPrepSkipKeepsIDs verifies that when a preparation
+// correspondence is skipped after an error, the remaining pairs still restore
+// under their exact stored payload_id rather than a guessed index-based ID.
+func TestRestoreDominantPrepSkipKeepsIDs(t *testing.T) {
+	gen := NewTextGenerator(1, DefaultSizeProfile(), 120, 400, 2000)
+	s := NewScenario(ScenarioConfig{Mode: ModeRestoreDominant, TotalPairs: 0, RestoreFraction: 1.0, RestoreBudget: 1, Seed: 1, RunID: "run"}, gen)
+	rd := s.(*restoreDominant)
+	// Simulate preparation where index 0 failed and was skipped: only indices
+	// 1 and 2 were created, with their real payload_ids.
+	rd.AddPrepared("prep-run-1", "original1", "mask1", 1)
+	rd.AddPrepared("prep-run-2", "original2", "mask2", 1)
+	// The restore must use one of the stored IDs (never the skipped prep-run-0)
+	// and the mask stored under that exact ID.
+	seen := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		st, ok := s.Next()
+		if !ok || st.IsMask {
+			t.Fatalf("expected restore step %d, got %+v ok=%v", i, st, ok)
+		}
+		if st.PayloadID == "prep-run-0" {
+			t.Errorf("restore used skipped index ID prep-run-0")
+		}
+		if st.PayloadID == "prep-run-1" && st.Payload != "mask1" {
+			t.Errorf("payload=%q want mask1 for prep-run-1", st.Payload)
+		}
+		if st.PayloadID == "prep-run-2" && st.Payload != "mask2" {
+			t.Errorf("payload=%q want mask2 for prep-run-2", st.Payload)
+		}
+		seen[st.PayloadID] = true
+	}
+	if !seen["prep-run-1"] || !seen["prep-run-2"] {
+		t.Errorf("expected both stored IDs to be restored, got %v", seen)
+	}
+}
+
+// TestRunIDEmbeddedInPayloadID verifies that the run_id is part of every
+// payload_id and that different run_ids produce different IDs for the same pair
+// index while the generated text stays the same.
+func TestRunIDEmbeddedInPayloadID(t *testing.T) {
+	gen1 := NewTextGenerator(7, DefaultSizeProfile(), 120, 400, 2000)
+	gen2 := NewTextGenerator(7, DefaultSizeProfile(), 120, 400, 2000)
+	s1 := NewScenario(ScenarioConfig{Mode: ModeSequential, TotalPairs: 2, Seed: 7, RunID: "runA"}, gen1)
+	s2 := NewScenario(ScenarioConfig{Mode: ModeSequential, TotalPairs: 2, Seed: 7, RunID: "runB"}, gen2)
+	st1, _ := s1.Next()
+	st2, _ := s2.Next()
+	if st1.PayloadID == st2.PayloadID {
+		t.Errorf("payload_ids should differ across runs: %q", st1.PayloadID)
+	}
+	if !strings.Contains(st1.PayloadID, "runA") {
+		t.Errorf("payload_id %q does not contain run_id runA", st1.PayloadID)
+	}
+	if st1.Payload != st2.Payload {
+		t.Errorf("texts should be reproducible across runs: %q vs %q", st1.Payload, st2.Payload)
 	}
 }

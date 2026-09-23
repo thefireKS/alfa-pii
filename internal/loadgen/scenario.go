@@ -35,9 +35,9 @@ type Scenario interface {
 
 // PreparedScenario is implemented by scenarios that restore a pre-created set
 // of correspondences. AddPrepared records one correspondence created by the
-// preparation phase together with its restore budget.
+// preparation phase together with its payload_id and restore budget.
 type PreparedScenario interface {
-	AddPrepared(original, mask string, budget int)
+	AddPrepared(id, original, mask string, budget int)
 }
 
 // Mode selects the operation distribution.
@@ -65,8 +65,13 @@ type ScenarioConfig struct {
 	// RestoreBudget is the maximum number of restores per pair in the
 	// restore-dominant mode.
 	RestoreBudget int
-	// Seed is the random seed for scenario decisions.
+	// Seed is the random seed for scenario decisions and text generation.
 	Seed int64
+	// RunID is a unique identifier for this run. It is embedded in every
+	// payload_id so a repeated run against a live service does not collide with
+	// correspondences created by an earlier run. It does not affect the seed, so
+	// the generated texts remain reproducible.
+	RunID string
 }
 
 // NewScenario builds a scenario for the given mode.
@@ -89,6 +94,7 @@ func NewScenario(cfg ScenarioConfig, gen *TextGenerator) Scenario {
 type sequential struct {
 	mu       sync.Mutex
 	gen      *TextGenerator
+	runID    string
 	total    int
 	nextPair int
 	// pendingReverse holds pairs whose mask is known and await a restore step.
@@ -103,6 +109,7 @@ type sequential struct {
 func newSequential(cfg ScenarioConfig, gen *TextGenerator) *sequential {
 	return &sequential{
 		gen:       gen,
+		runID:     cfg.RunID,
 		total:     cfg.TotalPairs,
 		masks:     make(map[string]string),
 		originals: make(map[string]string),
@@ -128,7 +135,7 @@ func (s *sequential) Next() (Step, bool) {
 		return Step{}, false
 	}
 	text, cat := s.gen.Next()
-	id := pairID(s.nextPair)
+	id := pairID(s.runID, s.nextPair)
 	s.nextPair++
 	s.originals[id] = text
 	return Step{
@@ -159,6 +166,7 @@ func (s *sequential) Pending() int { return 0 }
 type maskDominant struct {
 	mu       sync.Mutex
 	gen      *TextGenerator
+	runID    string
 	total    int
 	nextPair int
 	restore  float64
@@ -170,17 +178,19 @@ type maskDominant struct {
 }
 
 type pairState struct {
+	id       string
 	mask     string
 	original string
 }
 
 func newMaskDominant(cfg ScenarioConfig, gen *TextGenerator) *maskDominant {
 	return &maskDominant{
-		gen:      gen,
-		total:    cfg.TotalPairs,
-		restore:  cfg.RestoreFraction,
-		rng:      rand.New(rand.NewSource(cfg.Seed)),
-		pending:  make(map[string]pairState),
+		gen:     gen,
+		runID:   cfg.RunID,
+		total:   cfg.TotalPairs,
+		restore: cfg.RestoreFraction,
+		rng:     rand.New(rand.NewSource(cfg.Seed)),
+		pending: make(map[string]pairState),
 	}
 }
 
@@ -214,7 +224,7 @@ func (m *maskDominant) Next() (Step, bool) {
 		}, true
 	}
 	text, cat := m.gen.Next()
-	id := pairID(m.nextPair)
+	id := pairID(m.runID, m.nextPair)
 	m.nextPair++
 	return Step{
 		PayloadID: id,
@@ -226,16 +236,42 @@ func (m *maskDominant) Next() (Step, bool) {
 }
 
 func (m *maskDominant) Complete(st Step, r Response) {
-	if !st.IsMask || !r.IsValidSuccess() {
-		return
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.pending[st.PayloadID]; ok {
+	if st.IsMask {
+		// Forward step: store the mask so the pair can be restored later. A
+		// failed forward step leaves the pair unregistered; the caller retries
+		// with the same ID and text.
+		if !r.IsValidSuccess() {
+			return
+		}
+		if _, ok := m.pending[st.PayloadID]; ok {
+			return
+		}
+		m.pending[st.PayloadID] = pairState{id: st.PayloadID, mask: r.Result, original: st.Original}
+		m.pendingOrder = append(m.pendingOrder, st.PayloadID)
 		return
 	}
-	m.pending[st.PayloadID] = pairState{mask: r.Result, original: st.Original}
-	m.pendingOrder = append(m.pendingOrder, st.PayloadID)
+	// Reverse step: a successful restore completes the pair and removes it from
+	// the pending set so it is not selected again. On error or 429 the pair
+	// stays pending and is retried with the same ID and data.
+	if r.IsValidSuccess() && r.Result == st.Original {
+		m.removePending(st.PayloadID)
+	}
+}
+
+// removePending drops a pair from the pending set after a successful restore.
+func (m *maskDominant) removePending(id string) {
+	if _, ok := m.pending[id]; !ok {
+		return
+	}
+	delete(m.pending, id)
+	for i, v := range m.pendingOrder {
+		if v == id {
+			m.pendingOrder = append(m.pendingOrder[:i], m.pendingOrder[i+1:]...)
+			break
+		}
+	}
 }
 
 func (m *maskDominant) Pending() int {
@@ -248,11 +284,12 @@ func (m *maskDominant) Pending() int {
 // built by the preparation phase; each pair has a bounded restore budget so a
 // successful restore is not repeated infinitely under one ID.
 type restoreDominant struct {
-	mu       sync.Mutex
-	gen      *TextGenerator
-	restore  float64
-	rng      *rand.Rand
-	// pairs holds the pre-created correspondences.
+	mu      sync.Mutex
+	gen     *TextGenerator
+	runID   string
+	restore float64
+	rng     *rand.Rand
+	// pairs holds the pre-created correspondences together with their payload_id.
 	pairs []pairState
 	// budgets tracks remaining restores per pair index.
 	budgets []int
@@ -265,17 +302,20 @@ type restoreDominant struct {
 func newRestoreDominant(cfg ScenarioConfig, gen *TextGenerator) *restoreDominant {
 	return &restoreDominant{
 		gen:     gen,
+		runID:   cfg.RunID,
 		restore: cfg.RestoreFraction,
 		rng:     rand.New(rand.NewSource(cfg.Seed)),
 		total:   cfg.TotalPairs,
 	}
 }
 
-// AddPrepared registers a pre-created correspondence from the preparation phase.
-func (r *restoreDominant) AddPrepared(original, mask string, budget int) {
+// AddPrepared registers a pre-created correspondence from the preparation phase
+// together with the payload_id it was created under, so a restore step reuses
+// the exact ID and never guesses it from the pair index.
+func (r *restoreDominant) AddPrepared(id, original, mask string, budget int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.pairs = append(r.pairs, pairState{mask: mask, original: original})
+	r.pairs = append(r.pairs, pairState{id: id, mask: mask, original: original})
 	r.budgets = append(r.budgets, budget)
 }
 
@@ -289,7 +329,7 @@ func (r *restoreDominant) Next() (Step, bool) {
 			r.budgets[idx]--
 			p := r.pairs[idx]
 			return Step{
-				PayloadID: prepID(idx),
+				PayloadID: p.id,
 				Payload:   p.mask,
 				IsMask:    false,
 				Original:  p.original,
@@ -299,7 +339,7 @@ func (r *restoreDominant) Next() (Step, bool) {
 	// Otherwise create a new pair (mask step).
 	if r.nextNew < r.total {
 		text, cat := r.gen.Next()
-		id := pairID(r.total + r.nextNew)
+		id := pairID(r.runID, r.total+r.nextNew)
 		r.nextNew++
 		return Step{
 			PayloadID: id,
@@ -316,7 +356,7 @@ func (r *restoreDominant) Next() (Step, bool) {
 			r.budgets[i]--
 			p := r.pairs[i]
 			return Step{
-				PayloadID: prepID(i),
+				PayloadID: p.id,
 				Payload:   p.mask,
 				IsMask:    false,
 				Original:  p.original,
@@ -333,15 +373,17 @@ func (r *restoreDominant) Complete(st Step, resp Response) {
 
 func (r *restoreDominant) Pending() int { return 0 }
 
-// pairID builds a stable payload_id for a pair index.
-func pairID(i int) string {
-	return "load-" + itoa(i)
+// pairID builds a stable payload_id for a pair index. The run_id is embedded so
+// a repeated run against a live service does not collide with correspondences
+// created by an earlier run.
+func pairID(runID string, i int) string {
+	return "load-" + runID + "-" + itoa(i)
 }
 
 // prepID builds the payload_id used by the preparation phase for a prepared
 // pair. It must match the ID used when the correspondence was created.
-func prepID(i int) string {
-	return "prep-" + itoa(i)
+func prepID(runID string, i int) string {
+	return "prep-" + runID + "-" + itoa(i)
 }
 
 func itoa(n int) string {
