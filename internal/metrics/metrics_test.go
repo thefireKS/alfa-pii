@@ -73,3 +73,42 @@ func TestMetricsHandlerBounded(t *testing.T) {
 		t.Fatalf("read body: %v", err)
 	}
 }
+
+// TestStoreMetricsByAreaAndPhase verifies the store gauges are broken down by
+// the fixed area and phase labels and that a transition moves bytes from
+// pending to replay.
+func TestStoreMetricsByAreaAndPhase(t *testing.T) {
+	m := New()
+	m.StoreRecordAdded(AreaProcess, PhasePending)
+	m.StoreBytesDelta(AreaProcess, PhasePending, 100)
+	m.StoreRecordAdded(AreaManaged, PhaseReplay)
+	m.StoreBytesDelta(AreaManaged, PhaseReplay, 50)
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		`pii_store_records{area="process",phase="pending"} 1`,
+		`pii_store_bytes{area="process",phase="pending"} 100`,
+		`pii_store_records{area="managed",phase="replay"} 1`,
+		`pii_store_bytes{area="managed",phase="replay"} 50`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics body missing %q", want)
+		}
+	}
+	// A transition moves bytes from pending to replay.
+	m.StoreRecordRemoved(AreaProcess, PhasePending)
+	m.StoreBytesDelta(AreaProcess, PhasePending, -100)
+	m.StoreRecordAdded(AreaProcess, PhaseReplay)
+	m.StoreBytesDelta(AreaProcess, PhaseReplay, 100)
+	rec = httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body = rec.Body.String()
+	if !strings.Contains(body, `pii_store_records{area="process",phase="pending"} 0`) {
+		t.Fatalf("pending count not decremented after transition")
+	}
+	if !strings.Contains(body, `pii_store_records{area="process",phase="replay"} 1`) {
+		t.Fatalf("replay count not incremented after transition")
+	}
+}

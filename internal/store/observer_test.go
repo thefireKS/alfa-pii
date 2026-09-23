@@ -10,36 +10,42 @@ import (
 // recordingObserver captures store lifecycle events for assertions.
 type recordingObserver struct {
 	mu       sync.Mutex
-	added    int
-	removed  int
-	bytes    int64
-	ttl      int
+	added    map[string]int
+	removed  map[string]int
+	bytes    map[string]int64
+	ttl      map[string]int
 	failures map[string]int
 }
 
 func newRecordingObserver() *recordingObserver {
-	return &recordingObserver{failures: make(map[string]int)}
+	return &recordingObserver{
+		added:    make(map[string]int),
+		removed:  make(map[string]int),
+		bytes:    make(map[string]int64),
+		ttl:      make(map[string]int),
+		failures: make(map[string]int),
+	}
 }
 
-func (o *recordingObserver) RecordAdded() {
+func (o *recordingObserver) RecordAdded(phase string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.added++
+	o.added[phase]++
 }
-func (o *recordingObserver) RecordRemoved() {
+func (o *recordingObserver) RecordRemoved(phase string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.removed++
+	o.removed[phase]++
 }
-func (o *recordingObserver) BytesDelta(d int64) {
+func (o *recordingObserver) BytesDelta(phase string, d int64) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.bytes += d
+	o.bytes[phase] += d
 }
-func (o *recordingObserver) TTLExpired() {
+func (o *recordingObserver) TTLExpired(phase string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.ttl++
+	o.ttl[phase]++
 }
 func (o *recordingObserver) Failure(reason string) {
 	o.mu.Lock()
@@ -47,14 +53,30 @@ func (o *recordingObserver) Failure(reason string) {
 	o.failures[reason]++
 }
 
-func (o *recordingObserver) snapshot() (added, removed, ttl int, bytes int64, failures map[string]int) {
+func (o *recordingObserver) snapshot() (added, removed, ttl map[string]int, bytes map[string]int64, failures map[string]int) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	a := make(map[string]int, len(o.added))
+	for k, v := range o.added {
+		a[k] = v
+	}
+	r := make(map[string]int, len(o.removed))
+	for k, v := range o.removed {
+		r[k] = v
+	}
+	t := make(map[string]int, len(o.ttl))
+	for k, v := range o.ttl {
+		t[k] = v
+	}
+	b := make(map[string]int64, len(o.bytes))
+	for k, v := range o.bytes {
+		b[k] = v
+	}
 	f := make(map[string]int, len(o.failures))
 	for k, v := range o.failures {
 		f[k] = v
 	}
-	return o.added, o.removed, o.ttl, o.bytes, f
+	return a, r, t, b, f
 }
 
 // TestObserverRecordsCreationAndEviction verifies the observer is notified when
@@ -68,28 +90,27 @@ func TestObserverRecordsCreationAndEviction(t *testing.T) {
 		t.Fatalf("Create = created %v, err %v", created, err)
 	}
 	added, _, _, bytes, _ := obs.snapshot()
-	if added != 1 {
-		t.Fatalf("added = %d, want 1", added)
+	if added[PhasePending] != 1 {
+		t.Fatalf("added pending = %d, want 1", added[PhasePending])
 	}
-	if bytes <= 0 {
-		t.Fatalf("bytes = %d, want positive", bytes)
+	if bytes[PhasePending] <= 0 {
+		t.Fatalf("bytes pending = %d, want positive", bytes[PhasePending])
 	}
 
 	// Force lazy eviction by reading after the TTL elapses.
 	time.Sleep(20 * time.Millisecond)
 	s.Get("k")
 
-	added, removed, ttl, bytes, _ := obs.snapshot()
-	if removed != 1 {
-		t.Fatalf("removed = %d, want 1", removed)
+	_, removed, ttl, bytes, _ := obs.snapshot()
+	if removed[PhasePending] != 1 {
+		t.Fatalf("removed pending = %d, want 1", removed[PhasePending])
 	}
-	if ttl != 1 {
-		t.Fatalf("ttl = %d, want 1", ttl)
+	if ttl[PhasePending] != 1 {
+		t.Fatalf("ttl pending = %d, want 1", ttl[PhasePending])
 	}
-	if bytes != 0 {
-		t.Fatalf("bytes = %d, want 0 after eviction", bytes)
+	if bytes[PhasePending] != 0 {
+		t.Fatalf("bytes pending = %d, want 0 after eviction", bytes[PhasePending])
 	}
-	_ = added
 }
 
 // TestObserverRecordsCapacityFailure verifies the observer is notified when the

@@ -525,3 +525,183 @@ func TestProcessLargeTextCycle(t *testing.T) {
 		t.Fatalf("restore length = %d, want %d", len(res2.Text), len(original))
 	}
 }
+
+// TestProcessRestoreTransitionsToReplay verifies that a successful restore via
+// /process moves the record to the replay phase, so it survives past the
+// ordinary TTL and is released after the replay window.
+func TestProcessRestoreTransitionsToReplay(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	st := store.NewMemory(store.Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute, ReplayTTL: 2 * time.Minute, CreateWait: time.Second})
+	st.SetClock(clock.now)
+	svc := New([]Recognizer{recognizer.EmailRecognizer{}}, st, masker.New("PII"))
+	ctx := context.Background()
+	original := "mail a@b.ru"
+	res, err := svc.Process(ctx, "id-1", original)
+	if err != nil {
+		t.Fatalf("mask: %v", err)
+	}
+	masked := res.Text
+	// Restore near the end of the TTL.
+	clock.advance(59 * time.Second)
+	if _, err := svc.Process(ctx, "id-1", masked); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	// The record survives past the ordinary TTL because it is in replay.
+	clock.advance(2 * time.Second)
+	if _, ok := st.Get("process:id-1"); !ok {
+		t.Fatal("record should survive past TTL in replay phase")
+	}
+	// It expires after the replay window.
+	clock.advance(2 * time.Minute)
+	if _, ok := st.Get("process:id-1"); ok {
+		t.Fatal("record should expire after replay window")
+	}
+}
+
+// TestProcessOriginalEqualsMaskNoTransition verifies that when Original ==
+// Masked (the no-PII case) the direction is indistinguishable, so the record
+// keeps its ordinary TTL and is not moved to the replay phase.
+func TestProcessOriginalEqualsMaskNoTransition(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	st := store.NewMemory(store.Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute, ReplayTTL: 2 * time.Minute, CreateWait: time.Second})
+	st.SetClock(clock.now)
+	svc := New([]Recognizer{recognizer.EmailRecognizer{}}, st, masker.New("PII"))
+	ctx := context.Background()
+	text := "просто текст без данных"
+	if _, err := svc.Process(ctx, "id-oeq", text); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	// A repeat of the same text (Original == Masked) must not transition.
+	if _, err := svc.Process(ctx, "id-oeq", text); err != nil {
+		t.Fatalf("repeat: %v", err)
+	}
+	r, ok := st.Get("process:id-oeq")
+	if !ok {
+		t.Fatal("record missing")
+	}
+	if !r.FirstRestoreAt.IsZero() {
+		t.Fatal("Original == Masked must not transition to replay phase")
+	}
+	// The record expires after the ordinary TTL.
+	clock.advance(2 * time.Minute)
+	if _, ok := st.Get("process:id-oeq"); ok {
+		t.Fatal("record should expire after ordinary TTL")
+	}
+}
+
+// TestRestoreTransitionsToReplay verifies that a successful /v1/restore moves
+// the record to the replay phase, including the marker format.
+func TestRestoreTransitionsToReplay(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	st := store.NewMemory(store.Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute, ReplayTTL: 2 * time.Minute, CreateWait: time.Second})
+	st.SetClock(clock.now)
+	reg := recognizer.NewRegistry()
+	svc, err := NewManaged(reg, []recognizer.Type{recognizer.Email}, []Consumer{emailConsumer("alpha")}, st, st, masker.New("PII"))
+	if err != nil {
+		t.Fatalf("NewManaged: %v", err)
+	}
+	ctx := context.Background()
+	original := "mail a@b.ru"
+	ra, err := svc.Mask(ctx, "alpha", "id-1", original)
+	if err != nil {
+		t.Fatalf("mask: %v", err)
+	}
+	clock.advance(59 * time.Second)
+	if _, err := svc.Restore(ctx, "alpha", "id-1", ra.Text); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	clock.advance(2 * time.Second)
+	if _, ok := st.Get("alpha:id-1"); !ok {
+		t.Fatal("record should survive past TTL in replay phase")
+	}
+	clock.advance(2 * time.Minute)
+	if _, ok := st.Get("alpha:id-1"); ok {
+		t.Fatal("record should expire after replay window")
+	}
+}
+
+// TestRestoreStarsTransitionsToReplay verifies that an exact stars restore also
+// moves the record to the replay phase.
+func TestRestoreStarsTransitionsToReplay(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	st := store.NewMemory(store.Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute, ReplayTTL: 2 * time.Minute, CreateWait: time.Second})
+	st.SetClock(clock.now)
+	reg := recognizer.NewRegistry()
+	c := emailConsumer("alpha")
+	c.MaskFormat = FormatStars
+	svc, err := NewManaged(reg, []recognizer.Type{recognizer.Email}, []Consumer{c}, st, st, masker.New("PII"))
+	if err != nil {
+		t.Fatalf("NewManaged: %v", err)
+	}
+	ctx := context.Background()
+	original := "mail a@b.ru"
+	ra, err := svc.Mask(ctx, "alpha", "id-1", original)
+	if err != nil {
+		t.Fatalf("mask: %v", err)
+	}
+	if _, err := svc.Restore(ctx, "alpha", "id-1", ra.Text); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	r, ok := st.Get("alpha:id-1")
+	if !ok {
+		t.Fatal("record missing")
+	}
+	if r.FirstRestoreAt.IsZero() {
+		t.Fatal("stars restore should transition to replay phase")
+	}
+}
+
+// TestLateRestoreDoesNotCompleteNewRecord verifies that a late restore of an
+// old mask that does not match a newer record for the same key is rejected as a
+// conflict and does not transition the newer record to the replay phase.
+func TestLateRestoreDoesNotCompleteNewRecord(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	st := store.NewMemory(store.Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute, ReplayTTL: 2 * time.Minute, CreateWait: time.Second})
+	st.SetClock(clock.now)
+	svc := New([]Recognizer{recognizer.EmailRecognizer{}}, st, masker.New("PII"))
+	ctx := context.Background()
+	// Create an old record with a mask that differs from the new record's.
+	oldRes, err := svc.Process(ctx, "id-1", "mail a@b.ru")
+	if err != nil {
+		t.Fatalf("old mask: %v", err)
+	}
+	// The old record expires and a new record is created for the same key with
+	// a different mask.
+	clock.advance(2 * time.Minute)
+	if _, err := svc.Process(ctx, "id-1", "mail c@d.io and e@f.gh"); err != nil {
+		t.Fatalf("new mask: %v", err)
+	}
+	newRec, _ := st.Get("process:id-1")
+	// A late restore of the old mask does not match the new record, so it is a
+	// conflict and must not transition the new record.
+	if _, err := svc.Process(ctx, "id-1", oldRes.Text); !errors.Is(err, ErrConflict) {
+		t.Fatalf("late restore err = %v, want ErrConflict", err)
+	}
+	r, _ := st.Get("process:id-1")
+	if r.Original != "mail c@d.io and e@f.gh" {
+		t.Fatalf("new record original = %q, want new", r.Original)
+	}
+	if !r.FirstRestoreAt.IsZero() {
+		t.Fatal("new record must remain in pending phase after rejected late restore")
+	}
+	_ = newRec
+}
+
+// fakeClock is a controllable clock for TTL and replay-window tests. It is safe
+// for concurrent use because the store calls now() from multiple goroutines.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}

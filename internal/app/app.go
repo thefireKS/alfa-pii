@@ -102,6 +102,10 @@ type Recognizer interface {
 type Store interface {
 	Get(key string) (store.Record, bool)
 	Create(ctx context.Context, key string, build func(context.Context) (store.Record, error)) (store.Record, bool, error)
+	// MarkRestored transitions a record to the replay phase after a successful
+	// restore, tied to the record version the caller read. It is a no-op when
+	// the record was re-created for the same key or is already in replay.
+	MarkRestored(key string, version uint64) bool
 }
 
 // Registry builds recognizer sets and priorities for configured types.
@@ -237,6 +241,13 @@ func (s *Service) Process(ctx context.Context, payloadID, payload string) (Resul
 		return Result{Text: rec.Masked, Outcome: OutcomeRepeat}, nil
 	case payload == rec.Masked:
 		log.Info("stage", "stage", "operation", "direction", "restore")
+		// A successful restore moves the record to the replay phase so a lost
+		// response can be repeated. When Original == Masked the direction is
+		// indistinguishable (the no-PII case): the response is stable and the
+		// record keeps its normal TTL, so no transition is performed.
+		if rec.Original != rec.Masked {
+			s.processStore.MarkRestored(key, rec.Version)
+		}
 		return Result{Text: rec.Original, Outcome: OutcomeRestore}, nil
 	default:
 		return Result{}, ErrConflict
@@ -327,11 +338,13 @@ func (s *Service) Restore(ctx context.Context, consumerName, payloadID, masked s
 			return Result{}, ErrConflict
 		}
 		log.Info("stage", "stage", "restoration")
+		s.consumerStore.MarkRestored(key, rec.Version)
 		return Result{Text: rec.Original, Outcome: OutcomeRestore}, nil
 	default:
 		// Marker format: substitute the consumer's own markers inside the
 		// given text. Markers not in the table are left untouched.
 		log.Info("stage", "stage", "restoration")
+		s.consumerStore.MarkRestored(key, rec.Version)
 		return Result{Text: masker.Restore(masked, fromStoreTable(rec.Original, rec.Table)), Outcome: OutcomeRestore}, nil
 	}
 }

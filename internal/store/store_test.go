@@ -484,8 +484,8 @@ func TestCounterSymmetric(t *testing.T) {
 		t.Fatalf("bytes = %d after eviction, want 0", s.bytes)
 	}
 	_, _, _, bytes, _ := obs.snapshot()
-	if bytes != 0 {
-		t.Fatalf("observer bytes = %d, want 0", bytes)
+	if bytes[PhasePending] != 0 {
+		t.Fatalf("observer bytes pending = %d, want 0", bytes[PhasePending])
 	}
 }
 
@@ -545,8 +545,8 @@ func TestMassExpiryBatched(t *testing.T) {
 	s.mu.Lock()
 	ev := s.drainExpired()
 	s.mu.Unlock()
-	if ev.removed != drainBatchSize {
-		t.Fatalf("single drain removed %d, want %d", ev.removed, drainBatchSize)
+	if ev.removedPending != drainBatchSize {
+		t.Fatalf("single drain removed %d, want %d", ev.removedPending, drainBatchSize)
 	}
 	if len(s.entries) != n-drainBatchSize {
 		t.Fatalf("entries = %d after one batch, want %d (backlog not fully drained)", len(s.entries), n-drainBatchSize)
@@ -670,12 +670,12 @@ func (o *mutexCheckingObserver) check() {
 	}
 	o.store.mu.Unlock()
 }
-func (o *mutexCheckingObserver) RecordAdded()   { o.check() }
-func (o *mutexCheckingObserver) RecordRemoved() { o.check() }
-func (o *mutexCheckingObserver) BytesDelta(int64) {
+func (o *mutexCheckingObserver) RecordAdded(string)   { o.check() }
+func (o *mutexCheckingObserver) RecordRemoved(string) { o.check() }
+func (o *mutexCheckingObserver) BytesDelta(string, int64) {
 	o.check()
 }
-func (o *mutexCheckingObserver) TTLExpired() { o.check() }
+func (o *mutexCheckingObserver) TTLExpired(string) { o.check() }
 func (o *mutexCheckingObserver) Failure(string) {
 	o.check()
 }
@@ -736,5 +736,243 @@ func TestConcurrentGetCreateAcrossTTL(t *testing.T) {
 	// The expiry queue must hold at most one node per live record.
 	if s.expiries.Len() > len(s.entries) {
 		t.Fatalf("expiry queue len %d exceeds live records %d", s.expiries.Len(), len(s.entries))
+	}
+}
+
+// replayLimits returns limits with a short TTL and a replay window so tests can
+// cross both phase boundaries with a controllable clock.
+func replayLimits() Limits {
+	return Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute, ReplayTTL: 2 * time.Minute, CreateWait: time.Second}
+}
+
+// TestMarkRestoredTransitionsToReplay verifies that a successful restore moves
+// a record to the replay phase and extends its lifetime past the original TTL.
+func TestMarkRestoredTransitionsToReplay(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	s := NewMemory(replayLimits())
+	s.now = clock.now
+	rec, created, err := s.Create(context.Background(), "k", build(rec("orig", "mask")))
+	if err != nil || !created {
+		t.Fatalf("Create = created %v, err %v", created, err)
+	}
+	if !rec.FirstRestoreAt.IsZero() {
+		t.Fatal("new record should be in pending phase")
+	}
+	// Restore just before the original TTL elapses.
+	clock.advance(59 * time.Second)
+	if !s.MarkRestored("k", rec.Version) {
+		t.Fatal("MarkRestored should succeed")
+	}
+	// The record survives past the original TTL because the replay window
+	// extends it.
+	clock.advance(2 * time.Second) // now = CreatedAt + 61s > TTL
+	if _, ok := s.Get("k"); !ok {
+		t.Fatal("record should survive past original TTL in replay phase")
+	}
+	// It expires after the replay window elapses.
+	clock.advance(2 * time.Minute) // now = FirstRestoreAt + 2m = replay deadline
+	if _, ok := s.Get("k"); ok {
+		t.Fatal("record should expire after replay window")
+	}
+}
+
+// TestMarkRestoredDoesNotExtendOnRepeat verifies that a repeat within the replay
+// window does not push the deadline: the record expires at the original
+// FirstRestoreAt + ReplayTTL regardless of how many times it is restored.
+func TestMarkRestoredDoesNotExtendOnRepeat(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	s := NewMemory(replayLimits())
+	s.now = clock.now
+	rec, _, err := s.Create(context.Background(), "k", build(rec("orig", "mask")))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !s.MarkRestored("k", rec.Version) {
+		t.Fatal("first MarkRestored should succeed")
+	}
+	// Repeated restores within the window must not extend the deadline.
+	for i := 0; i < 5; i++ {
+		clock.advance(10 * time.Second)
+		if s.MarkRestored("k", rec.Version) {
+			t.Fatalf("repeat %d should not transition again", i)
+		}
+	}
+	// The record must expire at FirstRestoreAt + ReplayTTL, not later.
+	clock.advance(2 * time.Minute)
+	if _, ok := s.Get("k"); ok {
+		t.Fatal("record should expire at the original replay deadline")
+	}
+}
+
+// TestMarkRestoredVersionTie verifies that a late request holding an old record
+// version cannot complete a newer record re-created for the same key.
+func TestMarkRestoredVersionTie(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	s := NewMemory(replayLimits())
+	s.now = clock.now
+	oldRec, _, err := s.Create(context.Background(), "k", build(rec("old", "oldmask")))
+	if err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	// The old record expires and a new record is created for the same key.
+	clock.advance(2 * time.Minute)
+	newRec, created, err := s.Create(context.Background(), "k", build(rec("new", "newmask")))
+	if err != nil || !created {
+		t.Fatalf("re-create = created %v, err %v", created, err)
+	}
+	if oldRec.Version == newRec.Version {
+		t.Fatal("versions should differ after re-create")
+	}
+	// A late restore of the old version must not transition the new record.
+	if s.MarkRestored("k", oldRec.Version) {
+		t.Fatal("late MarkRestored with old version should be rejected")
+	}
+	r, ok := s.Get("k")
+	if !ok || r.Original != "new" {
+		t.Fatalf("Get = %+v, %v; want new record", r, ok)
+	}
+	if !r.FirstRestoreAt.IsZero() {
+		t.Fatal("new record must remain in pending phase")
+	}
+}
+
+// TestMarkRestoredRejectsMissingAndWrongVersion verifies MarkRestored is a no-op
+// for a missing key, a wrong version, and a record already in replay.
+func TestMarkRestoredRejectsMissingAndWrongVersion(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	s := NewMemory(replayLimits())
+	s.now = clock.now
+	if s.MarkRestored("missing", 1) {
+		t.Fatal("MarkRestored on missing key should be rejected")
+	}
+	rec, _, err := s.Create(context.Background(), "k", build(rec("orig", "mask")))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if s.MarkRestored("k", rec.Version+1) {
+		t.Fatal("MarkRestored with wrong version should be rejected")
+	}
+	if !s.MarkRestored("k", rec.Version) {
+		t.Fatal("first MarkRestored should succeed")
+	}
+	if s.MarkRestored("k", rec.Version) {
+		t.Fatal("second MarkRestored should be rejected (already replay)")
+	}
+}
+
+// TestReplayPhaseExpiresAfterReplayTTL verifies that a record restored near the
+// end of its TTL is kept for the full replay window and then released, so a
+// completed pair frees its slot after replay_ttl.
+func TestReplayPhaseExpiresAfterReplayTTL(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	s := NewMemory(Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute, ReplayTTL: 2 * time.Minute})
+	s.now = clock.now
+	r, _, err := s.Create(context.Background(), "a", build(rec("orig", "mask")))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Restore near the end of the TTL.
+	clock.advance(59 * time.Second)
+	if !s.MarkRestored("a", r.Version) {
+		t.Fatal("MarkRestored should succeed")
+	}
+	// The store is at MaxEntries=1; a new pair must be rejected while the
+	// completed pair is still in the replay window.
+	if _, _, err := s.Create(context.Background(), "b", build(rec("x", "y"))); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("Create b during replay = err %v, want ErrCapacity", err)
+	}
+	// After the replay window elapses the completed pair is released and a new
+	// pair is accepted.
+	clock.advance(2 * time.Minute)
+	if _, created, err := s.Create(context.Background(), "b", build(rec("x", "y"))); err != nil || !created {
+		t.Fatalf("Create b after replay expiry = created %v, err %v", created, err)
+	}
+}
+
+// TestPendingPhaseExpiresAfterTTL verifies that an un-restored record is
+// released after the ordinary TTL, freeing its slot for a new pair.
+func TestPendingPhaseExpiresAfterTTL(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	s := NewMemory(Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute, ReplayTTL: 2 * time.Minute})
+	s.now = clock.now
+	if _, _, err := s.Create(context.Background(), "a", build(rec("orig", "mask"))); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, _, err := s.Create(context.Background(), "b", build(rec("x", "y"))); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("Create b at capacity = err %v, want ErrCapacity", err)
+	}
+	// The un-restored record expires after the ordinary TTL.
+	clock.advance(2 * time.Minute)
+	if _, created, err := s.Create(context.Background(), "b", build(rec("x", "y"))); err != nil || !created {
+		t.Fatalf("Create b after TTL = created %v, err %v", created, err)
+	}
+}
+
+// TestObserverSeesPhaseTransition verifies the observer reports the move from
+// pending to replay: the pending count and bytes drop and the replay count and
+// bytes rise, so metrics can show completion and later release.
+func TestObserverSeesPhaseTransition(t *testing.T) {
+	obs := newRecordingObserver()
+	clock := &fakeClock{t: time.Now()}
+	s := NewMemory(replayLimits())
+	s.now = clock.now
+	s.SetObserver(obs)
+	rec, _, err := s.Create(context.Background(), "k", build(rec("orig", "mask")))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	added, _, _, bytes, _ := obs.snapshot()
+	if added[PhasePending] != 1 || bytes[PhasePending] <= 0 {
+		t.Fatalf("pending added=%d bytes=%d, want 1 and positive", added[PhasePending], bytes[PhasePending])
+	}
+	if !s.MarkRestored("k", rec.Version) {
+		t.Fatal("MarkRestored should succeed")
+	}
+	added, _, _, bytes, _ = obs.snapshot()
+	if added[PhaseReplay] != 1 {
+		t.Fatalf("replay added = %d, want 1", added[PhaseReplay])
+	}
+	if bytes[PhasePending] != 0 {
+		t.Fatalf("pending bytes = %d after transition, want 0", bytes[PhasePending])
+	}
+	if bytes[PhaseReplay] <= 0 {
+		t.Fatalf("replay bytes = %d, want positive", bytes[PhaseReplay])
+	}
+	// After the replay window elapses the record is evicted from replay.
+	clock.advance(2 * time.Minute)
+	s.Get("k")
+	_, removed, ttl, bytes, _ := obs.snapshot()
+	if removed[PhaseReplay] != 1 {
+		t.Fatalf("replay removed = %d, want 1", removed[PhaseReplay])
+	}
+	if ttl[PhaseReplay] != 1 {
+		t.Fatalf("replay ttl = %d, want 1", ttl[PhaseReplay])
+	}
+	if bytes[PhaseReplay] != 0 {
+		t.Fatalf("replay bytes = %d after eviction, want 0", bytes[PhaseReplay])
+	}
+}
+
+// TestReplayDrainUsesReplayDeadline verifies that the expiry drain evicts a
+// replay-phase record at its replay deadline even though its CreatedAt is
+// recent, so a completed pair is not retained past the replay window.
+func TestReplayDrainUsesReplayDeadline(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute, ReplayTTL: 2 * time.Minute})
+	s.now = clock.now
+	rec, _, err := s.Create(context.Background(), "k", build(rec("orig", "mask")))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	clock.advance(59 * time.Second)
+	if !s.MarkRestored("k", rec.Version) {
+		t.Fatal("MarkRestored should succeed")
+	}
+	// Advance past the replay deadline but keep CreatedAt within the TTL, so a
+	// drain keyed on CreatedAt alone would wrongly keep the record.
+	clock.advance(2 * time.Minute)
+	s.drainAll()
+	if _, ok := s.Get("k"); ok {
+		t.Fatal("replay-phase record should be drained at its replay deadline")
 	}
 }

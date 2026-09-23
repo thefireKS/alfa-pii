@@ -27,6 +27,16 @@ const (
 	StoreFailBusy     = "busy"
 )
 
+// Phases of a stored correspondence. A record is created in the pending phase
+// (awaiting its first restore) and moves to the replay phase after the first
+// successful restore, where it is kept for the replay window so a lost response
+// can be repeated. The phase is a fixed label used for observability; it is
+// never derived from user data.
+const (
+	PhasePending = "pending"
+	PhaseReplay  = "replay"
+)
+
 // Record is a stored correspondence for one key.
 type Record struct {
 	// Original is the unmasked text.
@@ -40,6 +50,16 @@ type Record struct {
 	Format string
 	// CreatedAt is the wall-clock time the record was created.
 	CreatedAt time.Time
+	// FirstRestoreAt is the wall-clock time of the first successful restore.
+	// A zero value means the record is still in the pending phase and expires
+	// after the store TTL. Once set, the record is in the replay phase and
+	// expires after FirstRestoreAt + ReplayTTL.
+	FirstRestoreAt time.Time
+	// Version is a monotonically increasing identifier assigned at publish
+	// time. It lets a caller tie a restore transition to the exact record it
+	// read: a late request holding an old version cannot complete a newer
+	// record that was re-created for the same key after expiry.
+	Version uint64
 	// size is the estimated memory footprint of the record, computed once at
 	// publish time and reused at eviction so the replacement table is not
 	// re-walked under the store mutex. It is unexported because it is an
@@ -71,6 +91,14 @@ type Store interface {
 	// capacity, ErrCapacity is returned; if the wait times out, ErrBusy is
 	// returned.
 	Create(ctx context.Context, key string, build func(context.Context) (Record, error)) (Record, bool, error)
+	// MarkRestored transitions the record for key from the pending phase to the
+	// replay phase, extending its lifetime to FirstRestoreAt + ReplayTTL. It
+	// returns true only if the transition happened: the record exists, its
+	// version matches version (so a late request cannot complete a newer record
+	// re-created for the same key), and it was not already in the replay phase.
+	// A repeat of the original or mask within the replay window does not extend
+	// the deadline, so MarkRestored is a no-op once the record is in replay.
+	MarkRestored(key string, version uint64) bool
 }
 
 // Limits bound the in-memory store.
@@ -81,8 +109,13 @@ type Limits struct {
 	MaxBytes int64
 	// MaxRecordBytes caps the estimated bytes of a single correspondence.
 	MaxRecordBytes int64
-	// TTL is how long a correspondence is kept after creation.
+	// TTL is how long a correspondence is kept after creation while it awaits
+	// its first restore (the pending phase).
 	TTL time.Duration
+	// ReplayTTL is how long a correspondence is kept after its first successful
+	// restore (the replay phase), so a lost response can be repeated. A repeat
+	// within the window does not extend the deadline.
+	ReplayTTL time.Duration
 	// CreateWait is the maximum time a caller waits for another creator of the
 	// same key before returning ErrBusy.
 	CreateWait time.Duration
@@ -168,16 +201,19 @@ func (q *expiryQueue) remove(key string) {
 // a nil observer disables reporting. Implementations must be safe for
 // concurrent use because events are reported from multiple goroutines. The
 // interface is declared here because the store is the caller of the observer.
+// Each event carries the record phase (pending or replay) so metrics can be
+// broken down by phase; the area (process or managed) is fixed per store and is
+// supplied by the observer implementation, not by the store.
 type Observer interface {
 	// RecordAdded is called when a new correspondence is published.
-	RecordAdded()
+	RecordAdded(phase string)
 	// RecordRemoved is called when a correspondence is evicted.
-	RecordRemoved()
-	// BytesDelta adjusts the accounted store bytes by delta.
-	BytesDelta(delta int64)
+	RecordRemoved(phase string)
+	// BytesDelta adjusts the accounted store bytes for the phase by delta.
+	BytesDelta(phase string, delta int64)
 	// TTLExpired is called when a correspondence is evicted because its TTL
 	// elapsed.
-	TTLExpired()
+	TTLExpired(phase string)
 	// Failure is called when the store refuses an operation for the given
 	// reason (capacity or busy).
 	Failure(reason string)
@@ -193,6 +229,7 @@ type Memory struct {
 	inflight map[string]*inflight
 	expiries *expiryQueue
 	obs      Observer
+	nextVer  uint64
 
 	stopCh  chan struct{}
 	doneCh  chan struct{}
@@ -218,6 +255,15 @@ func (s *Memory) SetObserver(o Observer) {
 	s.obs = o
 }
 
+// SetClock replaces the store's time source. It is a testing seam for
+// deterministic TTL and replay-window tests; production code never calls it.
+// It must be called before the store is used concurrently.
+func (s *Memory) SetClock(now func() time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.now = now
+}
+
 // Get implements Store. It checks the TTL of only the requested key, so the
 // cost of a read does not grow with the number of stored records. An expired
 // record for the requested key is removed eagerly (O(log n)); other expired
@@ -239,18 +285,25 @@ func (s *Memory) Get(key string) (Record, bool) {
 	return rec, true
 }
 
-// isExpired reports whether rec has outlived the store TTL. It must be called
-// with the mutex held.
+// isExpired reports whether rec has outlived its current phase deadline. A
+// record in the pending phase expires after the store TTL; a record in the
+// replay phase expires after FirstRestoreAt + ReplayTTL. A non-positive TTL
+// disables expiry entirely, matching the store's "no TTL" configuration. It
+// must be called with the mutex held.
 func (s *Memory) isExpired(rec Record) bool {
-	return isExpiredAt(rec.CreatedAt, s.now(), s.limits.TTL)
+	if s.limits.TTL <= 0 {
+		return false
+	}
+	return !s.recordExpiry(rec).After(s.now())
 }
 
-// isExpiredAt reports whether a record created at createdAt is expired at now
-// under the given TTL. A record is expired when now >= createdAt + TTL, so exact
-// equality of the deadline counts as expired. This is the single expiry boundary
-// used by both lazy eviction and the expiry queue.
-func isExpiredAt(createdAt, now time.Time, ttl time.Duration) bool {
-	return ttl > 0 && !createdAt.After(now.Add(-ttl))
+// recordExpiry returns the wall-clock deadline at which rec expires, based on
+// its phase. It must be called with the mutex held.
+func (s *Memory) recordExpiry(rec Record) time.Time {
+	if !rec.FirstRestoreAt.IsZero() {
+		return rec.FirstRestoreAt.Add(s.limits.ReplayTTL)
+	}
+	return rec.CreatedAt.Add(s.limits.TTL)
 }
 
 // Create implements Store. It is atomic for a single key: concurrent calls for
@@ -336,6 +389,8 @@ func (s *Memory) Create(ctx context.Context, key string, build func(context.Cont
 			s.reportFailure(StoreFailCapacity)
 			return Record{}, false, ErrCapacity
 		}
+		s.nextVer++
+		rec.Version = s.nextVer
 		s.entries[key] = rec
 		s.bytes += size
 		if s.limits.TTL > 0 {
@@ -384,6 +439,41 @@ func (s *Memory) finishInflight(key string, inf *inflight, rec Record, err error
 	inf.err = err
 	close(inf.done)
 	s.mu.Unlock()
+}
+
+// MarkRestored implements Store. It atomically moves the record for key from
+// the pending phase to the replay phase, extending its lifetime to
+// FirstRestoreAt + ReplayTTL. The transition is tied to the record version the
+// caller read: if the record was re-created for the same key after expiry, the
+// caller's version no longer matches and the newer record is left untouched. A
+// record already in the replay phase is not extended again, so repeated
+// restores within the window do not push the deadline. The expiry queue keeps
+// exactly one node per live record: the pending node is removed and the replay
+// node is pushed, so no stale nodes accumulate on repeats.
+func (s *Memory) MarkRestored(key string, version uint64) bool {
+	s.mu.Lock()
+	rec, ok := s.entries[key]
+	if !ok || rec.Version != version || !rec.FirstRestoreAt.IsZero() || s.limits.ReplayTTL <= 0 {
+		s.mu.Unlock()
+		return false
+	}
+	rec.FirstRestoreAt = s.now()
+	s.entries[key] = rec
+	s.expiries.remove(key)
+	if s.limits.ReplayTTL > 0 {
+		heap.Push(s.expiries, expiryNode{expiresAt: rec.FirstRestoreAt.Add(s.limits.ReplayTTL), key: key})
+	}
+	ev := pendingEvents{
+		removedPending: 1,
+		bytesPending:   -rec.size,
+	}
+	s.mu.Unlock()
+	s.flushEvents(ev)
+	if s.obs != nil {
+		s.obs.RecordAdded(PhaseReplay)
+		s.obs.BytesDelta(PhaseReplay, rec.size)
+	}
+	return true
 }
 
 // StartCleanup launches the background eviction goroutine. It is idempotent.
@@ -445,7 +535,7 @@ func (s *Memory) drainAll() {
 		ev := s.drainExpired()
 		s.mu.Unlock()
 		s.flushEvents(ev)
-		if ev.removed == 0 {
+		if ev.removedPending+ev.removedReplay == 0 {
 			return
 		}
 	}
@@ -468,7 +558,6 @@ func (s *Memory) drainExpired() pendingEvents {
 		return ev
 	}
 	now := s.now()
-	cutoff := now.Add(-s.limits.TTL)
 	for i := 0; i < drainBatchSize && s.expiries.Len() > 0; i++ {
 		top := s.expiries.nodes[0]
 		if top.expiresAt.After(now) {
@@ -481,13 +570,13 @@ func (s *Memory) drainExpired() pendingEvents {
 		}
 		// A stale node for a re-created key points at a record that is still
 		// live; leave it for its own (later) expiry node. With the indexed
-		// queue this should not occur, but the check keeps eviction safe.
-		if rec.CreatedAt.After(cutoff) {
+		// queue this should not occur, but the check keeps eviction safe. The
+		// record's own phase deadline is authoritative, so a replay-phase
+		// record is not skipped just because its CreatedAt is recent.
+		if s.recordExpiry(rec).After(now) {
 			continue
 		}
-		ev.removed++
-		ev.ttl++
-		ev.bytes -= rec.size
+		ev.remove(rec)
 		delete(s.entries, top.key)
 		s.bytes -= rec.size
 	}
@@ -500,17 +589,39 @@ func (s *Memory) evictLocked(key string, rec Record) pendingEvents {
 	delete(s.entries, key)
 	s.bytes -= rec.size
 	s.expiries.remove(key)
-	return pendingEvents{removed: 1, ttl: 1, bytes: -rec.size}
+	ev := pendingEvents{}
+	ev.remove(rec)
+	return ev
 }
 
 // pendingEvents accumulates observer notifications to be flushed after the
 // store mutex is released, so the observer is never called under the lock. The
-// counts and byte delta are bounded (no per-event queue), so concurrent adds and
-// removals keep the final counters accurate without an unbounded event buffer.
+// counts and byte deltas are bounded (no per-event queue), so concurrent adds
+// and removals keep the final counters accurate without an unbounded event
+// buffer. Events are tracked per phase so metrics can be broken down by
+// pending and replay.
 type pendingEvents struct {
-	removed int
-	ttl     int
-	bytes   int64
+	removedPending int
+	removedReplay  int
+	ttlPending     int
+	ttlReplay      int
+	bytesPending   int64
+	bytesReplay    int64
+}
+
+// remove records the eviction of a record in the given phase, including its
+// byte release and, for a TTL eviction, the TTL counter. It is used by both
+// lazy eviction and the expiry drain.
+func (ev *pendingEvents) remove(rec Record) {
+	if !rec.FirstRestoreAt.IsZero() {
+		ev.removedReplay++
+		ev.ttlReplay++
+		ev.bytesReplay -= rec.size
+		return
+	}
+	ev.removedPending++
+	ev.ttlPending++
+	ev.bytesPending -= rec.size
 }
 
 // flushEvents delivers accumulated observer notifications. It must be called
@@ -519,25 +630,34 @@ func (s *Memory) flushEvents(ev pendingEvents) {
 	if s.obs == nil {
 		return
 	}
-	for i := 0; i < ev.removed; i++ {
-		s.obs.RecordRemoved()
+	for i := 0; i < ev.removedPending; i++ {
+		s.obs.RecordRemoved(PhasePending)
 	}
-	for i := 0; i < ev.ttl; i++ {
-		s.obs.TTLExpired()
+	for i := 0; i < ev.removedReplay; i++ {
+		s.obs.RecordRemoved(PhaseReplay)
 	}
-	if ev.bytes != 0 {
-		s.obs.BytesDelta(ev.bytes)
+	for i := 0; i < ev.ttlPending; i++ {
+		s.obs.TTLExpired(PhasePending)
+	}
+	for i := 0; i < ev.ttlReplay; i++ {
+		s.obs.TTLExpired(PhaseReplay)
+	}
+	if ev.bytesPending != 0 {
+		s.obs.BytesDelta(PhasePending, ev.bytesPending)
+	}
+	if ev.bytesReplay != 0 {
+		s.obs.BytesDelta(PhaseReplay, ev.bytesReplay)
 	}
 }
 
-// reportAdded notifies the observer that a record was published. It must be
-// called without the mutex held.
+// reportAdded notifies the observer that a record was published in the pending
+// phase. It must be called without the mutex held.
 func (s *Memory) reportAdded(size int64) {
 	if s.obs == nil {
 		return
 	}
-	s.obs.RecordAdded()
-	s.obs.BytesDelta(size)
+	s.obs.RecordAdded(PhasePending)
+	s.obs.BytesDelta(PhasePending, size)
 }
 
 // reportFailure notifies the observer of a storage failure. It must be called

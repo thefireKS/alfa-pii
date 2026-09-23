@@ -89,6 +89,7 @@ func main() {
 		MaxBytes:        cfg.StoreMaxBytes,
 		MaxRecordBytes:  cfg.StoreMaxRecordBytes,
 		TTL:             cfg.StoreTTL,
+		ReplayTTL:       cfg.StoreReplayTTL,
 		CreateWait:      cfg.StoreCreateWait,
 		CleanupInterval: cfg.StoreCleanupInterval,
 	})
@@ -97,11 +98,12 @@ func main() {
 		MaxBytes:        cfg.StoreMaxBytes,
 		MaxRecordBytes:  cfg.StoreMaxRecordBytes,
 		TTL:             cfg.StoreTTL,
+		ReplayTTL:       cfg.StoreReplayTTL,
 		CreateWait:      cfg.StoreCreateWait,
 		CleanupInterval: cfg.StoreCleanupInterval,
 	})
-	processStore.SetObserver(storeObserver{met})
-	consumerStore.SetObserver(storeObserver{met})
+	processStore.SetObserver(storeObserver{met, metrics.AreaProcess})
+	consumerStore.SetObserver(storeObserver{met, metrics.AreaManaged})
 	processStore.StartCleanup()
 	consumerStore.StartCleanup()
 	defer processStore.Stop()
@@ -152,17 +154,20 @@ func main() {
 	logger.Info("stopped")
 }
 
-// storeObserver forwards store lifecycle events to the metrics collectors.
+// storeObserver forwards store lifecycle events to the metrics collectors. The
+// area (process or managed) is fixed per store instance and is never derived
+// from request data.
 type storeObserver struct {
-	met *metrics.Metrics
+	met  *metrics.Metrics
+	area string
 }
 
-func (o storeObserver) RecordAdded()   { o.met.StoreRecordAdded() }
-func (o storeObserver) RecordRemoved() { o.met.StoreRecordRemoved() }
-func (o storeObserver) BytesDelta(d int64) {
-	o.met.StoreBytesDelta(d)
+func (o storeObserver) RecordAdded(phase string)   { o.met.StoreRecordAdded(o.area, phase) }
+func (o storeObserver) RecordRemoved(phase string) { o.met.StoreRecordRemoved(o.area, phase) }
+func (o storeObserver) BytesDelta(phase string, d int64) {
+	o.met.StoreBytesDelta(o.area, phase, d)
 }
-func (o storeObserver) TTLExpired() { o.met.StoreTTLExpired() }
+func (o storeObserver) TTLExpired(phase string) { o.met.StoreTTLExpired(o.area, phase) }
 func (o storeObserver) Failure(reason string) {
 	o.met.StoreFailure(reason)
 }

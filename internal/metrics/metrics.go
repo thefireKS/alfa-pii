@@ -59,6 +59,23 @@ const (
 	StoreFailBusy     = "busy"
 )
 
+// Store areas are the fixed storage scopes. The unauthenticated /process scope
+// and the managed consumers use separate store instances, so their capacity and
+// phase accounting are isolated. The area is a fixed label, never derived from
+// request data.
+const (
+	AreaProcess = "process"
+	AreaManaged = "managed"
+)
+
+// Store phases mirror the store's two-phase lifetime: pending (awaiting the
+// first restore) and replay (after the first successful restore). The phase is
+// a fixed label, never derived from request data.
+const (
+	PhasePending = "pending"
+	PhaseReplay  = "replay"
+)
+
 // Metrics holds the service's Prometheus collectors.
 type Metrics struct {
 	registry *prometheus.Registry
@@ -71,9 +88,9 @@ type Metrics struct {
 	textChars *prometheus.CounterVec
 	tokens    *prometheus.CounterVec
 
-	storeRecords prometheus.Gauge
-	storeBytes   prometheus.Gauge
-	storeTTL     prometheus.Counter
+	storeRecords *prometheus.GaugeVec
+	storeBytes   *prometheus.GaugeVec
+	storeTTL     *prometheus.CounterVec
 	storeFail    *prometheus.CounterVec
 }
 
@@ -107,18 +124,18 @@ func New() *Metrics {
 			Name: "pii_tokens_total",
 			Help: "Estimated tokens processed by operation and counting method.",
 		}, []string{"operation", "method"}),
-		storeRecords: prometheus.NewGauge(prometheus.GaugeOpts{
+		storeRecords: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "pii_store_records",
-			Help: "Current number of stored correspondences.",
-		}),
-		storeBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Help: "Current number of stored correspondences by area and phase.",
+		}, []string{"area", "phase"}),
+		storeBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "pii_store_bytes",
-			Help: "Current accounted bytes held by stored correspondences.",
-		}),
-		storeTTL: prometheus.NewCounter(prometheus.CounterOpts{
+			Help: "Current accounted bytes held by stored correspondences by area and phase.",
+		}, []string{"area", "phase"}),
+		storeTTL: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pii_store_ttl_expired_total",
-			Help: "Total correspondences evicted because their TTL elapsed.",
-		}),
+			Help: "Total correspondences evicted because their TTL elapsed, by area and phase.",
+		}, []string{"area", "phase"}),
 		storeFail: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pii_store_failures_total",
 			Help: "Total storage failures by reason.",
@@ -165,15 +182,20 @@ func (m *Metrics) ObserveText(operation, text string) {
 func (m *Metrics) ActiveInc() { m.active.Inc() }
 func (m *Metrics) ActiveDec() { m.active.Dec() }
 
-// StoreRecordAdded and StoreRecordRemoved track the current record count.
-func (m *Metrics) StoreRecordAdded()   { m.storeRecords.Inc() }
-func (m *Metrics) StoreRecordRemoved() { m.storeRecords.Dec() }
+// StoreRecordAdded and StoreRecordRemoved track the current record count by
+// area and phase.
+func (m *Metrics) StoreRecordAdded(area, phase string)   { m.storeRecords.WithLabelValues(area, phase).Inc() }
+func (m *Metrics) StoreRecordRemoved(area, phase string) { m.storeRecords.WithLabelValues(area, phase).Dec() }
 
-// StoreBytesDelta adjusts the accounted store bytes by delta.
-func (m *Metrics) StoreBytesDelta(delta int64) { m.storeBytes.Add(float64(delta)) }
+// StoreBytesDelta adjusts the accounted store bytes by area and phase.
+func (m *Metrics) StoreBytesDelta(area, phase string, delta int64) {
+	m.storeBytes.WithLabelValues(area, phase).Add(float64(delta))
+}
 
-// StoreTTLExpired records a TTL eviction.
-func (m *Metrics) StoreTTLExpired() { m.storeTTL.Inc() }
+// StoreTTLExpired records a TTL eviction by area and phase.
+func (m *Metrics) StoreTTLExpired(area, phase string) {
+	m.storeTTL.WithLabelValues(area, phase).Inc()
+}
 
 // StoreFailure records a storage failure by reason.
 func (m *Metrics) StoreFailure(reason string) { m.storeFail.WithLabelValues(reason).Inc() }

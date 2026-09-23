@@ -24,6 +24,11 @@ func TestValidateRejectsInvalid(t *testing.T) {
 		t.Fatal("expected error for negative TTL")
 	}
 	cfg = Default()
+	cfg.StoreReplayTTL = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for zero replay TTL")
+	}
+	cfg = Default()
 	cfg.StoreMaxRecordBytes = 0
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for zero max record bytes")

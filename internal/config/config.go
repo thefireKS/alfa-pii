@@ -43,8 +43,13 @@ type Config struct {
 	StoreMaxBytes int64
 	// StoreMaxRecordBytes caps the estimated bytes of a single correspondence.
 	StoreMaxRecordBytes int64
-	// StoreTTL is how long a correspondence is kept after creation.
+	// StoreTTL is how long a correspondence is kept after creation while it
+	// awaits its first restore (the pending phase).
 	StoreTTL time.Duration
+	// StoreReplayTTL is how long a correspondence is kept after its first
+	// successful restore (the replay phase), so a lost response can be
+	// repeated. A repeat within the window does not extend the deadline.
+	StoreReplayTTL time.Duration
 	// StoreCreateWait is the maximum time a request waits for another request
 	// creating the same key before the store reports it busy.
 	StoreCreateWait time.Duration
@@ -78,7 +83,8 @@ func Default() Config {
 		StoreMaxEntries:      100_000,
 		StoreMaxBytes:        64 << 20, // 64 MiB
 		StoreMaxRecordBytes:  4 << 20,  // 4 MiB per record
-		StoreTTL:             24 * time.Hour,
+		StoreTTL:             10 * time.Minute,
+		StoreReplayTTL:       2 * time.Minute,
 		StoreCreateWait:      5 * time.Second,
 		StoreCleanupInterval: time.Minute,
 		MarkerPrefix:         "PII",
@@ -171,6 +177,13 @@ func Load() (Config, error) {
 		}
 		cfg.StoreTTL = d
 	}
+	if v := os.Getenv("PII_STORE_REPLAY_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("PII_STORE_REPLAY_TTL: %w", err)
+		}
+		cfg.StoreReplayTTL = d
+	}
 	if v := os.Getenv("PII_STORE_CREATE_WAIT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -246,6 +259,9 @@ func (c Config) Validate() error {
 	}
 	if c.StoreTTL <= 0 {
 		errs = append(errs, errors.New("store TTL must be positive"))
+	}
+	if c.StoreReplayTTL <= 0 {
+		errs = append(errs, errors.New("store replay TTL must be positive"))
 	}
 	if c.StoreCreateWait <= 0 {
 		errs = append(errs, errors.New("store create wait must be positive"))
