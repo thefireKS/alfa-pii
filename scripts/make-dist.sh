@@ -86,6 +86,7 @@ internal/recognizer/birthdate.go
 internal/recognizer/birthplace.go
 internal/recognizer/card.go
 internal/recognizer/cardholder.go
+internal/recognizer/casefold_test.go
 internal/recognizer/citizenship.go
 internal/recognizer/context_recognizers_test.go
 internal/recognizer/cvv.go

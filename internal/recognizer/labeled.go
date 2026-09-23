@@ -3,6 +3,8 @@ package recognizer
 import (
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // labelMatch records the byte offset just after a whole-word occurrence of a
@@ -12,10 +14,35 @@ type labelMatch struct {
 	after int
 }
 
+// lowerWithMap returns the lowercased text and a mapping from each byte offset
+// in the lowercased text to the corresponding byte offset in the original text.
+// strings.ToLower can change the byte length of a rune (for example U+212A
+// KELVIN SIGN becomes 'k'), so offsets found in the lowercased text must be
+// translated back to the original text before they are used to slice it. The
+// mapping has one extra entry for the end of the string.
+func lowerWithMap(text string) (string, []int) {
+	lower := make([]byte, 0, len(text))
+	mapping := make([]int, 0, len(text)+1)
+	for i := 0; i < len(text); {
+		r, size := utf8.DecodeRuneInString(text[i:])
+		lr := unicode.ToLower(r)
+		var buf [utf8.UTFMax]byte
+		n := utf8.EncodeRune(buf[:], lr)
+		for _, b := range buf[:n] {
+			lower = append(lower, b)
+			mapping = append(mapping, i)
+		}
+		i += size
+	}
+	mapping = append(mapping, len(text))
+	return string(lower), mapping
+}
+
 // findLabelMatches returns the offsets after each whole-word occurrence of any
-// label in text. Labels are matched case-insensitively.
+// label in text. Labels are matched case-insensitively. The returned offsets
+// are byte offsets into the original text.
 func findLabelMatches(text string, labels []string) []labelMatch {
-	lower := strings.ToLower(text)
+	lower, mapping := lowerWithMap(text)
 	var matches []labelMatch
 	for _, label := range labels {
 		ll := strings.ToLower(label)
@@ -26,7 +53,8 @@ func findLabelMatches(text string, labels []string) []labelMatch {
 			}
 			pos := i + j
 			if isWordBoundary(lower, pos, len(ll)) {
-				matches = append(matches, labelMatch{after: pos + len(ll)})
+				after := pos + len(ll)
+				matches = append(matches, labelMatch{after: mapping[after]})
 			}
 			i = pos + len(ll)
 		}
@@ -35,10 +63,13 @@ func findLabelMatches(text string, labels []string) []labelMatch {
 }
 
 // isWordBoundary reports whether the label at [pos, pos+length) in s is a whole
-// word (not part of a longer word). s must be lowercase.
+// word (not part of a longer word). s must be lowercase. The boundary is
+// checked on decoded runes so a multi-byte letter is not mistaken for a
+// non-letter and a non-letter multi-byte character (such as a non-breaking
+// space) is not mistaken for a letter.
 func isWordBoundary(s string, pos, length int) bool {
-	before := pos == 0 || !isLetter(s[pos-1])
-	after := pos+length >= len(s) || !isLetter(s[pos+length])
+	before := pos == 0 || !isLetterBefore(s, pos)
+	after := pos+length >= len(s) || !isLetterAfter(s, pos+length)
 	return before && after
 }
 
@@ -54,6 +85,7 @@ func findLabeledValue(text string, labels []string, valueRe *regexp.Regexp, typ 
 		if hi > len(text) {
 			hi = len(text)
 		}
+		hi = snapToRuneEnd(text, hi)
 		loc := valueRe.FindStringIndex(text[lo:hi])
 		if loc == nil {
 			continue
@@ -64,9 +96,10 @@ func findLabeledValue(text string, labels []string, valueRe *regexp.Regexp, typ 
 }
 
 // findDictRanges returns byte ranges of every whole-word occurrence of any
-// value in the dictionary. Values are matched case-insensitively.
+// value in the dictionary. Values are matched case-insensitively. The returned
+// ranges are byte offsets into the original text.
 func findDictRanges(text string, values []string) [][2]int {
-	lower := strings.ToLower(text)
+	lower, mapping := lowerWithMap(text)
 	var out [][2]int
 	for _, v := range values {
 		lv := strings.ToLower(v)
@@ -77,7 +110,7 @@ func findDictRanges(text string, values []string) [][2]int {
 			}
 			pos := i + j
 			if isWordBoundary(lower, pos, len(lv)) {
-				out = append(out, [2]int{pos, pos + len(v)})
+				out = append(out, [2]int{mapping[pos], mapping[pos+len(lv)]})
 			}
 			i = pos + len(lv)
 		}

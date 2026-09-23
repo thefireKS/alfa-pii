@@ -1,6 +1,10 @@
 package recognizer
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
 
 // digitSpan is a maximal run of digits and allowed structural characters.
 type digitSpan struct {
@@ -87,6 +91,24 @@ func findContextSigned(text string, structural string, length int, keywords []st
 	return frags, nil
 }
 
+// snapToRuneStart returns the smallest offset >= off that is on a rune
+// boundary, so a window never starts in the middle of a multi-byte rune.
+func snapToRuneStart(s string, off int) int {
+	for off < len(s) && !utf8.RuneStart(s[off]) {
+		off++
+	}
+	return off
+}
+
+// snapToRuneEnd returns the largest offset <= off that is on a rune boundary,
+// so a window never ends in the middle of a multi-byte rune.
+func snapToRuneEnd(s string, off int) int {
+	for off > 0 && off < len(s) && !utf8.RuneStart(s[off]) {
+		off--
+	}
+	return off
+}
+
 // hasContext reports whether any keyword appears as a whole word within a
 // window around the span [start,end). It is used to treat a requisite as
 // explicitly signed so it is masked even when a checksum fails.
@@ -99,6 +121,8 @@ func hasContext(text string, start, end int, keywords []string) bool {
 	if hi > len(text) {
 		hi = len(text)
 	}
+	lo = snapToRuneStart(text, lo)
+	hi = snapToRuneEnd(text, hi)
 	window := strings.ToLower(text[lo:hi])
 	for _, kw := range keywords {
 		if containsWord(window, kw) {
@@ -116,8 +140,8 @@ func containsWord(s, word string) bool {
 		if i < 0 {
 			return false
 		}
-		before := i == 0 || !isLetter(s[i-1])
-		after := i+len(word) >= len(s) || !isLetter(s[i+len(word)])
+		before := i == 0 || !isLetterBefore(s, i)
+		after := i+len(word) >= len(s) || !isLetterAfter(s, i+len(word))
 		if before && after {
 			return true
 		}
@@ -125,8 +149,24 @@ func containsWord(s, word string) bool {
 	}
 }
 
-// isLetter reports whether b is a Latin or Cyrillic letter byte. Bytes >= 0x80
-// are treated as letters to cover Cyrillic multi-byte sequences.
-func isLetter(b byte) bool {
-	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b >= 0x80
+// isLetterBefore reports whether the rune ending just before off is a letter.
+// off must be on a rune boundary. Decoding the rune instead of inspecting a
+// single byte keeps the boundary check correct for multi-byte letters and for
+// non-letter multi-byte characters such as a non-breaking space.
+func isLetterBefore(s string, off int) bool {
+	if off <= 0 {
+		return false
+	}
+	r, _ := utf8.DecodeLastRuneInString(s[:off])
+	return unicode.IsLetter(r)
+}
+
+// isLetterAfter reports whether the rune starting at off is a letter. off must
+// be on a rune boundary.
+func isLetterAfter(s string, off int) bool {
+	if off >= len(s) {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(s[off:])
+	return unicode.IsLetter(r)
 }
