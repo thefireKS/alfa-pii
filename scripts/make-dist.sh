@@ -111,6 +111,7 @@ internal/recognizer/regression2_test.go
 internal/recognizer/resolve_test.go
 internal/recognizer/scan.go
 internal/store/observer_test.go
+internal/store/bench_test.go
 internal/store/store.go
 internal/store/store_test.go
 tests/eval-results.txt

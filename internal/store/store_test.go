@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -324,5 +326,138 @@ func TestDifferentKeysIndependent(t *testing.T) {
 	r2, _ := s.Get("scope2:id")
 	if r1.Masked != "mask1" || r2.Masked != "mask2" {
 		t.Fatalf("scopes collided: %+v %+v", r1, r2)
+	}
+}
+
+// TestLongKeyCounted verifies that the held key is included in the memory
+// accounting, so a payload_id that dominates the request body cannot be stored
+// for free. A single 1 MiB key with an empty record must be rejected by the
+// per-record byte limit.
+func TestLongKeyCounted(t *testing.T) {
+	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Hour})
+	key := strings.Repeat("k", 1<<20)
+	if _, _, err := s.Create(context.Background(), key, build(rec("", ""))); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("Create with 1 MiB key = err %v, want ErrCapacity", err)
+	}
+	if s.bytes != 0 {
+		t.Fatalf("bytes = %d, want 0 after rejected create", s.bytes)
+	}
+}
+
+// TestKeyCountedAgainstTotalBytes verifies that keys count toward the total
+// byte budget, not only the per-record limit.
+func TestKeyCountedAgainstTotalBytes(t *testing.T) {
+	// Each record is 128 bytes of overhead plus a 100-byte key. Two records
+	// need 2*(128+100)=456 bytes; a budget of 400 must reject the second.
+	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 400, MaxRecordBytes: 1 << 20, TTL: time.Hour})
+	key := strings.Repeat("k", 100)
+	if _, created, err := s.Create(context.Background(), key, build(rec("", ""))); err != nil || !created {
+		t.Fatalf("first Create = created %v, err %v", created, err)
+	}
+	if _, _, err := s.Create(context.Background(), key+"x", build(rec("", ""))); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("second Create = err %v, want ErrCapacity", err)
+	}
+}
+
+// TestConcurrentFillRespectsLimit verifies that many concurrent creators for
+// different keys cannot collectively exceed the byte budget: the publish step
+// is atomic under the mutex and rejects any record that would overflow.
+func TestConcurrentFillRespectsLimit(t *testing.T) {
+	const perRecord = 100
+	s := NewMemory(Limits{MaxEntries: 1000, MaxBytes: 10 * perRecord, MaxRecordBytes: 1 << 20, TTL: time.Hour})
+	const n = 100
+	var wg sync.WaitGroup
+	created := make([]bool, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := fmt.Sprintf("k%d", i)
+			_, c, err := s.Create(context.Background(), key, build(rec(strings.Repeat("o", perRecord), strings.Repeat("m", perRecord))))
+			if err == nil {
+				created[i] = c
+			}
+		}(i)
+	}
+	wg.Wait()
+	total := 0
+	for _, c := range created {
+		if c {
+			total++
+		}
+	}
+	if total == 0 {
+		t.Fatal("no records created")
+	}
+	if s.bytes > 10*perRecord {
+		t.Fatalf("bytes = %d, exceeded budget %d", s.bytes, 10*perRecord)
+	}
+	if total > 10 {
+		t.Fatalf("created %d records, want at most 10 under the byte budget", total)
+	}
+}
+
+// TestTTLExpiryViaHeap verifies that expired records are reclaimed by the
+// expiry heap (background drain) and that a full store holding only expired
+// records accepts new ones.
+func TestTTLExpiryViaHeap(t *testing.T) {
+	now := time.Now()
+	s := NewMemory(Limits{MaxEntries: 1, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute})
+	s.now = func() time.Time { return now }
+	if _, created, err := s.Create(context.Background(), "a", build(rec("x", "y"))); err != nil || !created {
+		t.Fatalf("Create a = created %v, err %v", created, err)
+	}
+	s.now = func() time.Time { return now.Add(2 * time.Minute) }
+	// The store is at MaxEntries=1 and the only record is expired; a new create
+	// must drain it and succeed.
+	if _, created, err := s.Create(context.Background(), "b", build(rec("x", "y"))); err != nil || !created {
+		t.Fatalf("Create b after expiry = created %v, err %v", created, err)
+	}
+	if _, ok := s.Get("a"); ok {
+		t.Fatal("expired record a still present")
+	}
+}
+
+// TestRepeatAfterLostResponse verifies that a record is not deleted after the
+// first restore, so a client that lost the response can repeat and get the same
+// original again.
+func TestRepeatAfterLostResponse(t *testing.T) {
+	s := NewMemory(testLimits())
+	if _, created, err := s.Create(context.Background(), "k", build(rec("orig", "mask"))); err != nil || !created {
+		t.Fatalf("Create = created %v, err %v", created, err)
+	}
+	for i := 0; i < 3; i++ {
+		r, ok := s.Get("k")
+		if !ok || r.Original != "orig" {
+			t.Fatalf("repeat %d: got %+v, %v", i, r, ok)
+		}
+	}
+}
+
+// TestCounterSymmetric verifies that the accounted bytes return to zero after a
+// record is added and then evicted, and that the observer sees symmetric
+// deltas.
+func TestCounterSymmetric(t *testing.T) {
+	obs := newRecordingObserver()
+	now := time.Now()
+	s := NewMemory(Limits{MaxEntries: 10, MaxBytes: 1 << 20, MaxRecordBytes: 1 << 20, TTL: time.Minute})
+	s.now = func() time.Time { return now }
+	s.SetObserver(obs)
+	if _, created, err := s.Create(context.Background(), "k", build(rec("orig", "mask"))); err != nil || !created {
+		t.Fatalf("Create = created %v, err %v", created, err)
+	}
+	if s.bytes <= 0 {
+		t.Fatalf("bytes = %d after create, want positive", s.bytes)
+	}
+	s.now = func() time.Time { return now.Add(2 * time.Minute) }
+	if _, ok := s.Get("k"); ok {
+		t.Fatal("record should be expired")
+	}
+	if s.bytes != 0 {
+		t.Fatalf("bytes = %d after eviction, want 0", s.bytes)
+	}
+	_, _, _, bytes, _ := obs.snapshot()
+	if bytes != 0 {
+		t.Fatalf("observer bytes = %d, want 0", bytes)
 	}
 }

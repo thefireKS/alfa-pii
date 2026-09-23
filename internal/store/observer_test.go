@@ -9,12 +9,12 @@ import (
 
 // recordingObserver captures store lifecycle events for assertions.
 type recordingObserver struct {
-	mu        sync.Mutex
-	added     int
-	removed   int
-	bytes     int64
-	ttl       int
-	failures  map[string]int
+	mu       sync.Mutex
+	added    int
+	removed  int
+	bytes    int64
+	ttl      int
+	failures map[string]int
 }
 
 func newRecordingObserver() *recordingObserver {
