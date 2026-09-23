@@ -83,6 +83,10 @@ type Report struct {
 	// CPUPercent, RSSBytes are the peak service resource usage (container).
 	CPUPercent float64
 	RSSBytes   int64
+	// ServiceHeap is the service process Go heap in use at the end, from the
+	// pii_process_heap_inuse_bytes gauge. It complements RSS: RSS can stay high
+	// after objects are freed, while the heap gauge reflects live allocations.
+	ServiceHeap int64
 	// GeneratorHeap is the generator's own Go heap in use at the end.
 	GeneratorHeap int64
 	// GeneratorPeakHeap is the peak generator Go heap observed during the run.
@@ -196,6 +200,9 @@ func (r *Report) String() string {
 	if r.CPUPercent > 0 || r.RSSBytes > 0 {
 		w("Service resources (container): CPU=%.1f%% RSS=%d bytes", r.CPUPercent, r.RSSBytes)
 	}
+	if r.ServiceHeap > 0 {
+		w("Service heap in use: %d bytes", r.ServiceHeap)
+	}
 	if r.GeneratorHeap > 0 || r.GeneratorPeakHeap > 0 {
 		w("Generator resources (Go heap): heap=%d bytes peak=%d bytes", r.GeneratorHeap, r.GeneratorPeakHeap)
 	}
@@ -203,14 +210,14 @@ func (r *Report) String() string {
 		w("Container limits: %s", r.ContainerLimits)
 	}
 	if len(r.StoreDynamics) > 0 {
-		w("Store dynamics (records, bytes, mask, restore, 429, errors):")
+		w("Store dynamics (records, bytes, heap, mask, restore, 429, errors):")
 		for _, s := range r.StoreDynamics {
 			if !s.OK {
 				w("  %s  (metrics unavailable)", s.At.Format("15:04:05"))
 				continue
 			}
-			w("  %s  records=%d bytes=%d mask=%d restore=%d 429=%d errors=%d",
-				s.At.Format("15:04:05"), s.Records, s.Bytes, s.Mask, s.Restore, s.Overload, s.Errors)
+			w("  %s  records=%d bytes=%d heap=%d mask=%d restore=%d 429=%d errors=%d",
+				s.At.Format("15:04:05"), s.Records, s.Bytes, s.HeapInUse, s.Mask, s.Restore, s.Overload, s.Errors)
 		}
 	}
 	if r.SizeProfile != "" {

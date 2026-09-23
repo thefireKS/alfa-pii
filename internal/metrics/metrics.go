@@ -8,6 +8,7 @@ package metrics
 
 import (
 	"net/http"
+	"runtime"
 	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -84,6 +85,8 @@ type Metrics struct {
 	storeBytes   *prometheus.GaugeVec
 	storeTTL     *prometheus.CounterVec
 	storeFail    *prometheus.CounterVec
+
+	heapInUse prometheus.GaugeFunc
 }
 
 // New builds a Metrics with all collectors registered on a private registry.
@@ -132,11 +135,20 @@ func New() *Metrics {
 			Name: "pii_store_failures_total",
 			Help: "Total storage failures by reason.",
 		}, []string{"reason"}),
+		heapInUse: prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "pii_process_heap_inuse_bytes",
+			Help: "Current Go heap in use by the service process, in bytes. It is a runtime memory gauge with no user-data labels.",
+		}, func() float64 {
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			return float64(ms.HeapInuse)
+		}),
 	}
 	reg.MustRegister(
 		m.requests, m.duration, m.active,
 		m.textBytes, m.textChars, m.tokens,
 		m.storeRecords, m.storeBytes, m.storeTTL, m.storeFail,
+		m.heapInUse,
 	)
 	return m
 }

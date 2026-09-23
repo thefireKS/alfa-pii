@@ -51,6 +51,7 @@ func TestMetricsEndpointServesText(t *testing.T) {
 		"pii_text_bytes_total",
 		"pii_tokens_total",
 		"estimate_runes_div4",
+		"pii_process_heap_inuse_bytes",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics body missing %q", want)

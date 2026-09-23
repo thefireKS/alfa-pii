@@ -26,6 +26,10 @@ type ServiceMetrics struct {
 	StoreTTL            int64
 	StoreFailures       map[string]int64
 	Active              int64
+	// HeapInUse is the service process Go heap in use in bytes, from the
+	// pii_process_heap_inuse_bytes gauge. It complements RSS: RSS can stay high
+	// after objects are freed, while the heap gauge reflects live allocations.
+	HeapInUse int64
 	// ok reports whether the metrics were successfully fetched. When false the
 	// other fields are not meaningful and should be reported as missing data,
 	// not as zero values.
@@ -63,6 +67,8 @@ type StoreSample struct {
 	Restore  int64
 	Overload int64
 	Errors   int64
+	// HeapInUse is the service process Go heap in use at the poll time.
+	HeapInUse int64
 	// OK reports whether the metrics fetch succeeded for this sample.
 	OK bool
 }
@@ -105,6 +111,7 @@ func (p *MetricsPoller) Poll(ctx context.Context) {
 		Restore:  sm.RequestsTotal["process|restore"],
 		Overload: sm.RequestsTotal["process|overload"],
 		Errors:   sm.RequestsTotal["process|error"] + sm.RequestsTotal["process|timeout"],
+		HeapInUse: sm.HeapInUse,
 		OK:       sm.ok,
 	})
 	p.mu.Unlock()
@@ -143,6 +150,7 @@ var (
 	reTTL      = regexp.MustCompile(`pii_store_ttl_expired_total\{area="[^"]+",phase="[^"]+"\} (\d+)`)
 	reFail     = regexp.MustCompile(`pii_store_failures_total\{reason="([^"]+)"\} (\d+)`)
 	reActive   = regexp.MustCompile(`pii_active_requests (\d+)`)
+	reHeap     = regexp.MustCompile(`pii_process_heap_inuse_bytes ([0-9.eE+]+)`)
 )
 
 func parseMetrics(body string, sm *ServiceMetrics) {
@@ -181,6 +189,10 @@ func parseMetrics(body string, sm *ServiceMetrics) {
 	}
 	if m := reActive.FindStringSubmatch(body); m != nil {
 		sm.Active, _ = strconv.ParseInt(m[1], 10, 64)
+	}
+	if m := reHeap.FindStringSubmatch(body); m != nil {
+		f, _ := strconv.ParseFloat(m[1], 64)
+		sm.HeapInUse = int64(f)
 	}
 }
 

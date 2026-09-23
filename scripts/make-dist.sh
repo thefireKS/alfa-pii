@@ -33,6 +33,8 @@ docker-compose.yml
 compose.server.yml
 init-deploy-env.py
 smoke-deploy.py
+store-fill-test.py
+replay-boundary-test.py
 Makefile
 .env.example
 .dockerignore

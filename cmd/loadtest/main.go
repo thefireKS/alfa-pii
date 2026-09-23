@@ -210,6 +210,7 @@ func runMain(client *loadgen.Client, poller *loadgen.MetricsPoller,
 		MetricsOK:           sm.OK(),
 		CPUPercent:          peakCPU,
 		RSSBytes:            peakRSS,
+		ServiceHeap:         sm.HeapInUse,
 		GeneratorHeap:       genRes.HeapInUse,
 		StoreDynamics:       poller.StoreDynamics(),
 		ContainerLimits:     loadgen.ContainerLimits(containerName()),
@@ -471,6 +472,7 @@ func runScheduled(ctx context.Context, client *loadgen.Client, poller *loadgen.M
 		MetricsOK:           sm.OK(),
 		CPUPercent:          peakCPU,
 		RSSBytes:            peakRSS,
+		ServiceHeap:         sm.HeapInUse,
 		GeneratorHeap:       genRes.HeapInUse,
 		StoreDynamics:       poller.StoreDynamics(),
 		ContainerLimits:     loadgen.ContainerLimits(containerName()),
@@ -556,6 +558,7 @@ func writeJSON(outDir, name string, rep *loadgen.Report) {
 		At       string `json:"at"`
 		Records  int64  `json:"records"`
 		Bytes    int64  `json:"bytes"`
+		Heap     int64  `json:"heap"`
 		Mask     int64  `json:"mask"`
 		Restore  int64  `json:"restore"`
 		Overload int64  `json:"overload"`
@@ -598,6 +601,7 @@ func writeJSON(outDir, name string, rep *loadgen.Report) {
 		MetricsOK           bool                                  `json:"metrics_ok"`
 		CPUPercent          float64                               `json:"cpu_percent"`
 		RSSBytes            int64                                 `json:"rss_bytes"`
+		ServiceHeap         int64                                 `json:"service_heap"`
 		GeneratorHeap       int64                                 `json:"generator_heap"`
 		ContainerLimits     string                                `json:"container_limits"`
 		SizeProfile         string                                `json:"size_profile"`
@@ -649,6 +653,7 @@ func writeJSON(outDir, name string, rep *loadgen.Report) {
 		MetricsOK:           rep.MetricsOK,
 		CPUPercent:          rep.CPUPercent,
 		RSSBytes:            rep.RSSBytes,
+		ServiceHeap:         rep.ServiceHeap,
 		GeneratorHeap:       rep.GeneratorHeap,
 		ContainerLimits:     rep.ContainerLimits,
 		SizeProfile:         rep.SizeProfile,
@@ -702,6 +707,7 @@ func writeJSON(outDir, name string, rep *loadgen.Report) {
 				At:       s.At.Format(time.RFC3339),
 				Records:  s.Records,
 				Bytes:    s.Bytes,
+				Heap:     s.HeapInUse,
 				Mask:     s.Mask,
 				Restore:  s.Restore,
 				Overload: s.Overload,
