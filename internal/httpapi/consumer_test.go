@@ -260,3 +260,34 @@ func TestV1InvalidBody(t *testing.T) {
 		})
 	}
 }
+
+// TestMaskRestoreDistinctMarkersOverHTTP verifies the full /v1/mask ->
+// /v1/restore cycle for a separate synthetic consumer when the input already
+// contains a literal marker that occupies a low number. Distinct original
+// values must receive distinct markers so restoration is exact.
+func TestMaskRestoreDistinctMarkersOverHTTP(t *testing.T) {
+	h, err := newConsumerHandler(
+		[]app.Consumer{emailConsumer("alpha")},
+		map[string]string{"alpha-secret": "alpha"},
+	)
+	if err != nil {
+		t.Fatalf("newConsumerHandler: %v", err)
+	}
+	original := "[PII_0] email alice@example.test, второй bob@example.test"
+	rec := doAuthed(t, h, "/v1/mask", "alpha-secret", `{"payload":"`+original+`","payload_id":"id-1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mask status = %d, body=%q", rec.Code, rec.Body.String())
+	}
+	masked := decodeResult(t, rec)
+	if strings.Contains(masked, "alice@example.test") || strings.Contains(masked, "bob@example.test") {
+		t.Fatalf("masked %q still contains original emails", masked)
+	}
+	// Restore the exact mask and verify the original is recovered precisely.
+	rec = doAuthed(t, h, "/v1/restore", "alpha-secret", `{"payload":"`+masked+`","payload_id":"id-1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("restore status = %d, body=%q", rec.Code, rec.Body.String())
+	}
+	if got := decodeResult(t, rec); got != original {
+		t.Fatalf("restore = %q, want %q (masked=%q)", got, original, masked)
+	}
+}
