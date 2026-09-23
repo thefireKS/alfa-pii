@@ -18,11 +18,6 @@ type processRequest struct {
 	PayloadID string `json:"payload_id"`
 }
 
-// processResponse is the success body for POST /process.
-type processResponse struct {
-	Result string `json:"result"`
-}
-
 // Outcome classifies the result of one request attempt.
 type Outcome string
 
@@ -51,8 +46,14 @@ type Response struct {
 	RetryAfter time.Duration
 	// Err is the transport or decode error, when any.
 	Err error
-	// Latency is the round-trip time of the attempt.
+	// Latency is the round-trip time of the attempt, measured until the full
+	// response body has been read. It includes the time spent waiting for and
+	// reading the body, not just the headers.
 	Latency time.Duration
+	// TTFB is the time to first byte: the interval until the response headers
+	// arrive. It is a separate measurement from Latency, which also covers the
+	// body read.
+	TTFB time.Duration
 }
 
 // IsValidSuccess reports whether the response is a well-formed success: HTTP
@@ -106,31 +107,34 @@ func (c *Client) Send(ctx context.Context, payloadID, payload string) Response {
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.http.Do(req)
-	latency := time.Since(start)
+	ttfb := time.Since(start)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
-			return Response{Outcome: OutcomeTimeout, Latency: latency, Err: err}
+			return Response{Outcome: OutcomeTimeout, Latency: ttfb, TTFB: ttfb, Err: err}
 		}
-		return Response{Outcome: OutcomeError, Latency: latency, Err: err}
+		return Response{Outcome: OutcomeError, Latency: ttfb, TTFB: ttfb, Err: err}
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := readBodyLimited(resp.Body, maxResponseBytes)
 	if err != nil {
-		return Response{Status: resp.StatusCode, Outcome: OutcomeError, Latency: latency, Err: fmt.Errorf("read body: %w", err)}
+		return Response{Status: resp.StatusCode, Outcome: OutcomeError, Latency: time.Since(start), TTFB: ttfb, Err: fmt.Errorf("read body: %w", err)}
 	}
+	// Latency is measured after the full body has been read so the time spent
+	// waiting for and reading the body is included in the round-trip time.
+	latency := time.Since(start)
 
-	r := Response{Status: resp.StatusCode, Latency: latency}
+	r := Response{Status: resp.StatusCode, Latency: latency, TTFB: ttfb}
 	switch {
 	case resp.StatusCode == http.StatusOK:
-		var pr processResponse
-		if err := json.Unmarshal(raw, &pr); err != nil {
+		result, ok := decodeResult(raw)
+		if !ok {
 			r.Outcome = OutcomeInvalid
-			r.Err = fmt.Errorf("decode response: %w", err)
+			r.Err = fmt.Errorf("invalid result in response")
 			return r
 		}
 		r.Outcome = OutcomeOK
-		r.Result = pr.Result
+		r.Result = result
 	case resp.StatusCode == http.StatusTooManyRequests:
 		r.Outcome = OutcomeOverload
 		r.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
@@ -167,6 +171,44 @@ func parseRetryAfter(v string) time.Duration {
 	return time.Duration(n) * time.Second
 }
 
+// maxResponseBytes bounds the size of a response body the client will read.
+const maxResponseBytes = 1 << 20
+
+// readBodyLimited reads the body up to maxResponseBytes and reports an error
+// when the body exceeds the limit, so a truncated response is never silently
+// accepted as a complete one.
+func readBodyLimited(r io.Reader, limit int64) ([]byte, error) {
+	raw, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > limit {
+		return nil, fmt.Errorf("response body exceeds %d bytes", limit)
+	}
+	return raw, nil
+}
+
+// decodeResult extracts the string result from a valid JSON response. It
+// reports false when the result field is missing, is the JSON null literal, or
+// is not a JSON string. An empty string is a valid result, so {"result":""} is
+// accepted while {} and {"result":null} are rejected.
+func decodeResult(raw []byte) (string, bool) {
+	var pr struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &pr); err != nil {
+		return "", false
+	}
+	if len(pr.Result) == 0 || bytes.Equal(bytes.TrimSpace(pr.Result), []byte("null")) {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(pr.Result, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
 // RetryPolicy bounds retries for a single logical operation. A retry reuses the
 // same payload_id and text. At most MaxAttempts attempts are made; after a 429
 // the Retry-After delay is respected.
@@ -183,28 +225,29 @@ func DefaultRetryPolicy() RetryPolicy {
 }
 
 // SendWithRetry sends a request and retries on error or 429, reusing the same
-// payload_id and text. It returns the last response and the number of attempts
-// made. After a final failure of a mask step, no fake restore is created by the
-// caller.
-func (c *Client) SendWithRetry(ctx context.Context, payloadID, payload string, policy RetryPolicy) (Response, int) {
-	var last Response
+// payload_id and text. It returns the final response and every attempt made, so
+// the caller can account for each actual HTTP send and its outcome. After a
+// final failure of a mask step, no fake restore is created by the caller.
+func (c *Client) SendWithRetry(ctx context.Context, payloadID, payload string, policy RetryPolicy) (Response, []Response) {
+	var attempts []Response
 	for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
-		last = c.Send(ctx, payloadID, payload)
-		if last.Outcome != OutcomeError && last.Outcome != OutcomeOverload && last.Outcome != OutcomeTimeout {
-			return last, attempt
+		resp := c.Send(ctx, payloadID, payload)
+		attempts = append(attempts, resp)
+		if resp.Outcome != OutcomeError && resp.Outcome != OutcomeOverload && resp.Outcome != OutcomeTimeout {
+			return resp, attempts
 		}
 		if attempt == policy.MaxAttempts {
-			return last, attempt
+			return resp, attempts
 		}
 		delay := policy.BaseDelay
-		if last.Outcome == OutcomeOverload && last.RetryAfter > 0 {
-			delay = last.RetryAfter
+		if resp.Outcome == OutcomeOverload && resp.RetryAfter > 0 {
+			delay = resp.RetryAfter
 		}
 		select {
 		case <-ctx.Done():
-			return last, attempt
+			return resp, attempts
 		case <-time.After(delay):
 		}
 	}
-	return last, policy.MaxAttempts
+	return attempts[len(attempts)-1], attempts
 }

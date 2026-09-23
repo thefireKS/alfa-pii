@@ -158,6 +158,11 @@ func runMain(ctx context.Context, client *loadgen.Client, poller *loadgen.Metric
 		MaskNoChange:    maskNoChange,
 		StopReason:      stopReason,
 		Stats:           runner.Stats(),
+		LatencyByClass:  runner.Stats().LatencyByClass(),
+		OpLatency:       runner.Stats().OpLatency(),
+		ActualRPS:       rps(sent, duration),
+		SuccessRPS:      rps(maskSuccess+restoreSuccess, duration),
+		OverloadFraction: fraction(runner.Stats().OutcomeCount(loadgen.OutcomeOverload), sent),
 		Pending:         scenario.Pending(),
 		StoreRecords:    sm.StoreRecords,
 		StoreBytes:      sm.StoreBytes,
@@ -170,6 +175,7 @@ func runMain(ctx context.Context, client *loadgen.Client, poller *loadgen.Metric
 		Notes: []string{
 			"Token estimate is runes/4 (no exact tokenizer); sizes are in bytes and chars.",
 			"Generator memory is separate from service memory; inputs are pre-generated.",
+			"Latency is measured until the full response body is read; TTFB is separate.",
 		},
 	}
 
@@ -384,6 +390,11 @@ func runScheduled(ctx context.Context, client *loadgen.Client, poller *loadgen.M
 		MaskNoChange:    maskNoChange,
 		StopReason:      stopReason,
 		Stats:           sched.Stats(),
+		LatencyByClass:  sched.Stats().LatencyByClass(),
+		OpLatency:       sched.Stats().OpLatency(),
+		ActualRPS:       rps(sent, duration),
+		SuccessRPS:      rps(maskSuccess+restoreSuccess, duration),
+		OverloadFraction: fraction(sched.Stats().OutcomeCount(loadgen.OutcomeOverload), sent),
 		Pending:         scenario.Pending(),
 		StoreRecords:    sm.StoreRecords,
 		StoreBytes:      sm.StoreBytes,
@@ -395,6 +406,7 @@ func runScheduled(ctx context.Context, client *loadgen.Client, poller *loadgen.M
 		Notes: []string{
 			"Scheduled mode: fixed rate, bounded queue, late sends and skips visible.",
 			"Late count is not tracked per-slot; skips are queue-full drops.",
+			"Retries are gated by the configured rate so the achieved send rate stays within the intensity.",
 		},
 	}
 	writeReport(outDir, "scheduled.txt", rep)
@@ -495,6 +507,11 @@ func writeJSON(outDir, name string, rep *loadgen.Report) {
 		Notes           []string   `json:"notes"`
 		Stats           *jsonStats `json:"stats"`
 		Latency         *jsonLatency `json:"latency"`
+		LatencyByClass  map[loadgen.LatencyClass]*jsonLatency `json:"latency_by_class"`
+		OpLatency       *jsonLatency `json:"op_latency"`
+		ActualRPS       float64    `json:"actual_rps"`
+		SuccessRPS      float64    `json:"success_rps"`
+		OverloadFraction float64   `json:"overload_fraction"`
 	}
 	jr := &jsonReport{
 		Title:           rep.Title,
@@ -522,6 +539,9 @@ func writeJSON(outDir, name string, rep *loadgen.Report) {
 		OpFraction:      rep.OpFraction,
 		Preparation:     rep.Preparation,
 		Notes:           rep.Notes,
+		ActualRPS:       rep.ActualRPS,
+		SuccessRPS:      rep.SuccessRPS,
+		OverloadFraction: rep.OverloadFraction,
 	}
 	if rep.Stats != nil {
 		snap := rep.Stats.Snapshot()
@@ -538,6 +558,25 @@ func writeJSON(outDir, name string, rep *loadgen.Report) {
 			P50:  pcts[50].String(),
 			P95:  pcts[95].String(),
 			P99:  pcts[99].String(),
+		}
+	}
+	if len(rep.LatencyByClass) > 0 {
+		jr.LatencyByClass = make(map[loadgen.LatencyClass]*jsonLatency, len(rep.LatencyByClass))
+		for class, s := range rep.LatencyByClass {
+			jr.LatencyByClass[class] = &jsonLatency{
+				Mean: s.Mean.String(),
+				P50:  s.P50.String(),
+				P95:  s.P95.String(),
+				P99:  s.P99.String(),
+			}
+		}
+	}
+	if rep.OpLatency.Mean > 0 {
+		jr.OpLatency = &jsonLatency{
+			Mean: rep.OpLatency.Mean.String(),
+			P50:  rep.OpLatency.P50.String(),
+			P95:  rep.OpLatency.P95.String(),
+			P99:  rep.OpLatency.P99.String(),
 		}
 	}
 	data, err := json.MarshalIndent(jr, "", "  ")
@@ -564,6 +603,22 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b)
+}
+
+// rps returns the rate of count events over the given duration.
+func rps(count int64, d time.Duration) float64 {
+	if d <= 0 {
+		return 0
+	}
+	return float64(count) / d.Seconds()
+}
+
+// fraction returns count/total, or 0 when total is zero.
+func fraction(count, total int64) float64 {
+	if total <= 0 {
+		return 0
+	}
+	return float64(count) / float64(total)
 }
 
 func runeCount(s string) int {

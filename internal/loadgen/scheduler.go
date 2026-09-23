@@ -23,10 +23,13 @@ type Scheduler struct {
 	queue chan Step
 	// workers is the concurrency limit.
 	workers int
+	// retryPacer gates retry attempts so the achieved HTTP send rate
+	// (including retries) stays within the configured intensity.
+	retryPacer *Pacer
 
 	// scheduled counts steps placed on the schedule.
 	scheduled int64
-	// sent counts steps actually sent.
+	// sent counts HTTP requests actually sent, including retries.
 	sent int64
 	// late counts steps sent later than their scheduled slot.
 	late int64
@@ -59,20 +62,25 @@ func NewScheduler(client *Client, scenario Scenario, cfg SchedulerConfig) *Sched
 	if cfg.Queue <= 0 {
 		cfg.Queue = 1
 	}
+	if cfg.Target <= 0 {
+		cfg.Target = 1
+	}
 	return &Scheduler{
-		client:   client,
-		scenario: scenario,
-		policy:   cfg.Retry,
-		stats:    NewStats(),
-		target:   cfg.Target,
-		queue:    make(chan Step, cfg.Queue),
-		workers:  cfg.Workers,
+		client:     client,
+		scenario:   scenario,
+		policy:     cfg.Retry,
+		stats:      NewStats(),
+		target:     cfg.Target,
+		queue:      make(chan Step, cfg.Queue),
+		workers:    cfg.Workers,
+		retryPacer: NewPacer(PacerConfig{Target: cfg.Target, Ramp: 0, Queue: cfg.Queue}),
 	}
 }
 
 // Run drives the scheduler until the context is done or the scenario is
 // exhausted. It returns the stop reason.
 func (s *Scheduler) Run(ctx context.Context) string {
+	defer s.retryPacer.Stop()
 	var wg sync.WaitGroup
 	for i := 0; i < s.workers; i++ {
 		wg.Add(1)
@@ -123,7 +131,9 @@ func (s *Scheduler) produce(ctx context.Context) {
 	}
 }
 
-// worker consumes steps from the queue and sends them.
+// worker consumes steps from the queue and sends them with retries, gating each
+// retry attempt with the retry pacer so the achieved send rate stays within the
+// configured intensity.
 func (s *Scheduler) worker(ctx context.Context) {
 	for {
 		select {
@@ -133,39 +143,83 @@ func (s *Scheduler) worker(ctx context.Context) {
 			if !ok {
 				return
 			}
-			atomic.AddInt64(&s.sent, 1)
-			resp, _ := s.client.SendWithRetry(ctx, step.PayloadID, step.Payload, s.policy)
-			s.record(step, resp)
-			s.scenario.Complete(step, resp)
+			final, attempts, opLatency := s.sendWithRetry(ctx, step)
+			s.record(step, final, attempts, opLatency)
+			s.scenario.Complete(step, final)
 		}
 	}
 }
 
-// record classifies a response and updates counters.
-func (s *Scheduler) record(step Step, resp Response) {
+// sendWithRetry sends a step with retries, gating each retry attempt with the
+// retry pacer. It returns the final response, every attempt, and the total
+// logical-operation duration. The sent counter is incremented on each actual
+// HTTP send.
+func (s *Scheduler) sendWithRetry(ctx context.Context, step Step) (Response, []Response, time.Duration) {
+	start := time.Now()
+	var attempts []Response
+	for attempt := 1; attempt <= s.policy.MaxAttempts; attempt++ {
+		if attempt > 1 {
+			if !s.retryPacer.Wait(ctx) {
+				break
+			}
+		}
+		resp := s.client.Send(ctx, step.PayloadID, step.Payload)
+		atomic.AddInt64(&s.sent, 1)
+		attempts = append(attempts, resp)
+		if resp.Outcome != OutcomeError && resp.Outcome != OutcomeOverload && resp.Outcome != OutcomeTimeout {
+			return resp, attempts, time.Since(start)
+		}
+		if attempt == s.policy.MaxAttempts {
+			return resp, attempts, time.Since(start)
+		}
+		delay := s.policy.BaseDelay
+		if resp.Outcome == OutcomeOverload && resp.RetryAfter > 0 {
+			delay = resp.RetryAfter
+		}
+		select {
+		case <-ctx.Done():
+			return resp, attempts, time.Since(start)
+		case <-time.After(delay):
+		}
+	}
+	last := attempts[len(attempts)-1]
+	return last, attempts, time.Since(start)
+}
+
+// record classifies every attempt and records its latency, then records the
+// logical-operation duration.
+func (s *Scheduler) record(step Step, final Response, attempts []Response, opLatency time.Duration) {
 	payloadBytes := len(step.Payload)
 	payloadChars := runeCount(step.Payload)
+	for _, resp := range attempts {
+		s.recordAttempt(step, resp, payloadBytes, payloadChars)
+	}
+	s.stats.RecordOp(opLatency)
+}
+
+// recordAttempt classifies one attempt and updates counters.
+func (s *Scheduler) recordAttempt(step Step, resp Response, payloadBytes, payloadChars int) {
 	switch {
 	case resp.Status == 200 && resp.Outcome == OutcomeOK:
 		if step.IsMask {
 			if resp.Result == step.Original {
 				atomic.AddInt64(&s.maskNoChange, 1)
-				s.stats.RecordChars(OutcomeRepeat, resp.Status, resp.Latency, payloadBytes, payloadChars)
+				s.stats.RecordAttempt(LatencyOther, OutcomeRepeat, resp.Status, resp.Latency, payloadBytes, payloadChars)
 			} else {
 				atomic.AddInt64(&s.maskSuccess, 1)
-				s.stats.RecordChars(OutcomeMask, resp.Status, resp.Latency, payloadBytes, payloadChars)
+				s.stats.RecordAttempt(LatencyMask, OutcomeMask, resp.Status, resp.Latency, payloadBytes, payloadChars)
 			}
 		} else {
 			if resp.Result == step.Original {
 				atomic.AddInt64(&s.restoreSuccess, 1)
-				s.stats.RecordChars(OutcomeRestore, resp.Status, resp.Latency, payloadBytes, payloadChars)
+				s.stats.RecordAttempt(LatencyRestore, OutcomeRestore, resp.Status, resp.Latency, payloadBytes, payloadChars)
 			} else {
 				atomic.AddInt64(&s.restoreMismatch, 1)
-				s.stats.RecordChars(OutcomeError, resp.Status, resp.Latency, payloadBytes, payloadChars)
+				s.stats.RecordAttempt(LatencyError, OutcomeError, resp.Status, resp.Latency, payloadBytes, payloadChars)
 			}
 		}
 	default:
-		s.stats.RecordChars(resp.Outcome, resp.Status, resp.Latency, payloadBytes, payloadChars)
+		s.stats.RecordAttempt(latencyClassFor(resp), resp.Outcome, resp.Status, resp.Latency, payloadBytes, payloadChars)
 	}
 }
 

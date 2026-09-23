@@ -88,7 +88,7 @@ func New() *Metrics {
 		}, []string{"operation", "outcome"}),
 		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "pii_response_duration_seconds",
-			Help:    "Response duration by operation and class, enabling mean and p50/p95/p99.",
+			Help:    "Service response duration by operation and class, measured until the response is written (including serialization), enabling mean and p50/p95/p99.",
 			Buckets: prometheus.ExponentialBuckets(0.001, 2, 14), // 1ms .. ~16s
 		}, []string{"operation", "class"}),
 		active: prometheus.NewGauge(prometheus.GaugeOpts{

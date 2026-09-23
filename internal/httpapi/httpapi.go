@@ -176,8 +176,8 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request, operation strin
 	log.Info("stage", "stage", "accept")
 
 	if r.Method != http.MethodPost {
-		h.finish(log, operation, metrics.OutcomeMethodNotAllowed, metrics.ClassOther, start)
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		h.finish(log, operation, metrics.OutcomeMethodNotAllowed, metrics.ClassOther, start)
 		return
 	}
 
@@ -207,8 +207,8 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request, operation strin
 	// the request is refused with 429.
 	working := estimateWorkingBytesFromBody(r.ContentLength, h.maxBody)
 	if !h.working.acquire(working) {
-		h.finishOverload(log, operation, start)
 		writeRetryAfter(w, "working memory budget exceeded")
+		h.finishOverload(log, operation, start)
 		return
 	}
 	defer h.working.release(working)
@@ -222,13 +222,13 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request, operation strin
 	res, err := fn(ctx, consumer, req)
 	if err != nil {
 		outcome, class := h.outcomeForError(err)
-		h.finish(log, operation, outcome, class, start)
 		h.writeAppError(w, err)
+		h.finish(log, operation, outcome, class, start)
 		return
 	}
 	h.metrics.ObserveText(operation, req.Payload)
-	h.finish(log, operation, string(res.Outcome), metrics.ClassSuccess, start)
 	writeJSON(w, http.StatusOK, processResponse{Result: res.Text})
+	h.finish(log, operation, string(res.Outcome), metrics.ClassSuccess, start)
 }
 
 // acquire enforces the active-request limit before the body is read so large
@@ -337,7 +337,10 @@ func (h *Handler) outcomeForError(err error) (string, string) {
 	}
 }
 
-// finish records the outcome and duration and logs the completion stage.
+// finish records the outcome and duration and logs the completion stage. It is
+// called after the response has been written so the measured duration includes
+// serialization and the write, as far as the server can observe them. Client
+// side reading of the response body is a separate measurement.
 func (h *Handler) finish(log *slog.Logger, operation, outcome, class string, start time.Time) {
 	seconds := time.Since(start).Seconds()
 	h.metrics.ObserveRequest(operation, outcome, class, seconds)

@@ -34,6 +34,17 @@ type Report struct {
 	StopReason string
 	// Stats holds latency and outcome counters.
 	Stats *Stats
+	// LatencyByClass holds per-attempt latency summaries by class.
+	LatencyByClass map[LatencyClass]LatencySummary
+	// OpLatency holds the logical-operation latency summary (with retries).
+	OpLatency LatencySummary
+	// ActualRPS is the actual HTTP send rate over the measured interval,
+	// counting every attempt including retries.
+	ActualRPS float64
+	// SuccessRPS is the successful-operation rate over the measured interval.
+	SuccessRPS float64
+	// OverloadFraction is the fraction of attempts that returned 429.
+	OverloadFraction float64
 	// Pending is the number of pending pairs at the end.
 	Pending int
 	// StoreRecords, StoreBytes are the final store metrics.
@@ -74,14 +85,34 @@ func (r *Report) String() string {
 	w("Successful: mask=%d restore=%d", r.MaskSuccess, r.RestoreSuccess)
 	w("Restore mismatches: %d", r.RestoreMismatch)
 	w("Mask no-change (no PII): %d", r.MaskNoChange)
+	if r.ActualRPS > 0 || r.SuccessRPS > 0 {
+		w("RPS: actual=%.1f success=%.1f", r.ActualRPS, r.SuccessRPS)
+	}
+	if r.OverloadFraction > 0 {
+		w("429 fraction: %.3f", r.OverloadFraction)
+	}
 	w("Pending pairs at end: %d", r.Pending)
 	w("Stop reason: %s", r.StopReason)
 	w("")
 
 	if r.Stats != nil {
 		mean, pcts := r.Stats.Percentiles(50, 95, 99)
-		w("Latency: mean=%s p50=%s p95=%s p99=%s", mean.Round(time.Microsecond),
+		w("Latency (all attempts): mean=%s p50=%s p95=%s p99=%s", mean.Round(time.Microsecond),
 			pcts[50].Round(time.Microsecond), pcts[95].Round(time.Microsecond), pcts[99].Round(time.Microsecond))
+		if len(r.LatencyByClass) > 0 {
+			w("Latency by class:")
+			for _, c := range []LatencyClass{LatencyMask, LatencyRestore, LatencyOverload, LatencyError, LatencyTimeout, LatencyOther} {
+				if s, ok := r.LatencyByClass[c]; ok {
+					w("  %-9s mean=%s p50=%s p95=%s p99=%s", c, s.Mean.Round(time.Microsecond),
+						s.P50.Round(time.Microsecond), s.P95.Round(time.Microsecond), s.P99.Round(time.Microsecond))
+				}
+			}
+		}
+		if r.OpLatency.Mean > 0 {
+			w("Logical operation latency (with retries): mean=%s p50=%s p95=%s p99=%s",
+				r.OpLatency.Mean.Round(time.Microsecond), r.OpLatency.P50.Round(time.Microsecond),
+				r.OpLatency.P95.Round(time.Microsecond), r.OpLatency.P99.Round(time.Microsecond))
+		}
 		snap := r.Stats.Snapshot()
 		w("Requests recorded: %d", snap.Count)
 		w("Outcomes:")

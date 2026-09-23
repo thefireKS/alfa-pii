@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,10 +58,10 @@ func TestParseRetryAfter(t *testing.T) {
 }
 
 func TestSendWithRetryRetriesOn429(t *testing.T) {
-	var attempts int
+	var calls int
 	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
-		attempts++
-		if attempts < 3 {
+		calls++
+		if calls < 3 {
 			w.Header().Set("Retry-After", "0")
 			w.WriteHeader(429)
 			return
@@ -71,9 +72,9 @@ func TestSendWithRetryRetriesOn429(t *testing.T) {
 	})
 	client := NewClient(srv.URL, 10, time.Second)
 	policy := RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond}
-	resp, n := client.SendWithRetry(context.Background(), "id", "text", policy)
-	if n != 3 {
-		t.Errorf("attempts=%d want 3", n)
+	resp, attempts := client.SendWithRetry(context.Background(), "id", "text", policy)
+	if len(attempts) != 3 {
+		t.Errorf("attempts=%d want 3", len(attempts))
 	}
 	if resp.Outcome != OutcomeOK {
 		t.Errorf("outcome=%s want ok", resp.Outcome)
@@ -86,9 +87,9 @@ func TestSendWithRetryStopsAfterMax(t *testing.T) {
 	})
 	client := NewClient(srv.URL, 10, time.Second)
 	policy := RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond}
-	resp, n := client.SendWithRetry(context.Background(), "id", "text", policy)
-	if n != 3 {
-		t.Errorf("attempts=%d want 3", n)
+	resp, attempts := client.SendWithRetry(context.Background(), "id", "text", policy)
+	if len(attempts) != 3 {
+		t.Errorf("attempts=%d want 3", len(attempts))
 	}
 	if resp.Outcome != OutcomeError {
 		t.Errorf("outcome=%s want error", resp.Outcome)
@@ -317,5 +318,219 @@ func TestRunner429DoesNotResetCounter(t *testing.T) {
 	reason := runner.Run(ctx)
 	if reason != "five consecutive invalid responses" {
 		t.Errorf("stop reason=%q want compatibility stop", reason)
+	}
+}
+
+// TestClientLatencyIncludesBodyWait verifies that the HTTP latency is measured
+// until the full response body has been read, not just until the headers
+// arrive. The server sends the headers immediately and delays the body; the
+// recorded latency must include the body wait. The comparison is not a strict
+// benchmark: it only asserts the body wait is not zeroed out.
+func TestClientLatencyIncludesBodyWait(t *testing.T) {
+	const bodyDelay = 120 * time.Millisecond
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		time.Sleep(bodyDelay)
+		json.NewEncoder(w).Encode(map[string]string{"result": "masked"})
+	})
+	client := NewClient(srv.URL, 10, time.Second)
+	resp := client.Send(context.Background(), "id", "text")
+	if resp.Outcome != OutcomeOK {
+		t.Fatalf("outcome=%s want ok", resp.Outcome)
+	}
+	if resp.Latency < bodyDelay {
+		t.Errorf("latency=%s < body delay %s: body wait not included", resp.Latency, bodyDelay)
+	}
+	if resp.TTFB >= resp.Latency {
+		t.Errorf("ttfb=%s >= latency=%s: TTFB should be shorter than full latency", resp.TTFB, resp.Latency)
+	}
+}
+
+// TestClientReadError verifies that a broken body read is reported as an error
+// and not silently accepted.
+func TestClientReadError(t *testing.T) {
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"result":"partial`))
+		// Close the connection without completing the body.
+		if hj, ok := w.(http.Hijacker); ok {
+			conn, _, _ := hj.Hijack()
+			conn.Close()
+		}
+	})
+	client := NewClient(srv.URL, 10, time.Second)
+	resp := client.Send(context.Background(), "id", "text")
+	if resp.Outcome != OutcomeError {
+		t.Errorf("outcome=%s want error for broken body", resp.Outcome)
+	}
+}
+
+// TestClientInvalidResult verifies that a 200 response without a string result
+// is classified as invalid, while an empty string result is valid.
+func TestClientInvalidResult(t *testing.T) {
+	cases := []struct {
+		name   string
+		body   string
+		wantOK bool
+	}{
+		{"empty object", `{}`, false},
+		{"null result", `{"result":null}`, false},
+		{"non-string result", `{"result":123}`, false},
+		{"empty string result", `{"result":""}`, true},
+		{"valid result", `{"result":"masked"}`, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(200)
+				w.Write([]byte(c.body))
+			})
+			client := NewClient(srv.URL, 10, time.Second)
+			resp := client.Send(context.Background(), "id", "text")
+			if c.wantOK {
+				if resp.Outcome != OutcomeOK {
+					t.Errorf("outcome=%s want ok for body %q", resp.Outcome, c.body)
+				}
+			} else if resp.Outcome != OutcomeInvalid {
+				t.Errorf("outcome=%s want invalid for body %q", resp.Outcome, c.body)
+			}
+		})
+	}
+}
+
+// TestClientReadOverflow verifies that a response body exceeding the read limit
+// is detected as an error rather than silently truncated.
+func TestClientReadOverflow(t *testing.T) {
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		// Write a body larger than maxResponseBytes.
+		big := strings.Repeat("x", maxResponseBytes+1024)
+		w.Write([]byte(`{"result":"` + big + `"}`))
+	})
+	client := NewClient(srv.URL, 10, time.Second)
+	resp := client.Send(context.Background(), "id", "text")
+	if resp.Outcome != OutcomeError {
+		t.Errorf("outcome=%s want error for oversized body", resp.Outcome)
+	}
+}
+
+// singleMaskScenario issues exactly one mask step and then exhausts, so a test
+// can isolate the retry series of a single logical operation.
+type singleMaskScenario struct {
+	issued bool
+}
+
+func (s *singleMaskScenario) Next() (Step, bool) {
+	if s.issued {
+		return Step{}, false
+	}
+	s.issued = true
+	return Step{PayloadID: "id", Payload: "text", IsMask: true, Original: "text"}, true
+}
+
+func (s *singleMaskScenario) Complete(Step, Response) {}
+func (s *singleMaskScenario) Pending() int            { return 0 }
+
+// TestRunnerRecordsRetrySeries verifies that a 429 -> 503 -> 200 sequence is
+// recorded as three sends with three outcomes and one completed logical
+// operation.
+func TestRunnerRecordsRetrySeries(t *testing.T) {
+	var n int
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		n++
+		switch n {
+		case 1:
+			w.WriteHeader(429)
+		case 2:
+			w.WriteHeader(503)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			json.NewEncoder(w).Encode(map[string]string{"result": "masked"})
+		}
+	})
+	client := NewClient(srv.URL, 10, time.Second)
+	scenario := &singleMaskScenario{}
+	pacer := NewPacer(PacerConfig{Target: 1000, Ramp: 0, Queue: 16})
+	defer pacer.Stop()
+	runner := NewRunner(client, scenario, pacer, RunnerConfig{
+		Workers:               1,
+		Retry:                 RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond},
+		MaxConsecutiveInvalid: 5,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	runner.Run(ctx)
+
+	sent, maskSuccess, _, _, _ := runner.Counts()
+	if sent != 3 {
+		t.Errorf("sent=%d want 3 (three HTTP sends)", sent)
+	}
+	if maskSuccess != 1 {
+		t.Errorf("maskSuccess=%d want 1 (one logical operation)", maskSuccess)
+	}
+	stats := runner.Stats()
+	if got := stats.OutcomeCount(OutcomeOverload); got != 1 {
+		t.Errorf("overload count=%d want 1", got)
+	}
+	if got := stats.OutcomeCount(OutcomeError); got != 1 {
+		t.Errorf("error count=%d want 1", got)
+	}
+	if got := stats.OutcomeCount(OutcomeMask); got != 1 {
+		t.Errorf("mask count=%d want 1", got)
+	}
+	// The logical operation duration must be recorded.
+	if op := stats.OpLatency(); op.Mean <= 0 {
+		t.Errorf("op latency mean=%s want > 0", op.Mean)
+	}
+}
+
+// TestSchedulerRecordsRetrySeries verifies the scheduler records each actual
+// HTTP send of a retry series and one completed logical operation.
+func TestSchedulerRecordsRetrySeries(t *testing.T) {
+	var n int
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		n++
+		switch n {
+		case 1:
+			w.WriteHeader(429)
+		case 2:
+			w.WriteHeader(503)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			json.NewEncoder(w).Encode(map[string]string{"result": "masked"})
+		}
+	})
+	client := NewClient(srv.URL, 10, time.Second)
+	scenario := &singleMaskScenario{}
+	sched := NewScheduler(client, scenario, SchedulerConfig{
+		Target:  1000,
+		Workers: 1,
+		Queue:   16,
+		Retry:   RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	sched.Run(ctx)
+
+	_, sent, _, _, maskSuccess, _, _, _ := sched.Counts()
+	if sent != 3 {
+		t.Errorf("sent=%d want 3 (three HTTP sends)", sent)
+	}
+	if maskSuccess != 1 {
+		t.Errorf("maskSuccess=%d want 1 (one logical operation)", maskSuccess)
+	}
+	stats := sched.Stats()
+	if got := stats.OutcomeCount(OutcomeOverload); got != 1 {
+		t.Errorf("overload count=%d want 1", got)
+	}
+	if got := stats.OutcomeCount(OutcomeError); got != 1 {
+		t.Errorf("error count=%d want 1", got)
 	}
 }

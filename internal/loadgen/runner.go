@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Runner drives a load run: it starts workers that consume pacer slots, pull
@@ -90,32 +91,84 @@ func (r *Runner) Run(ctx context.Context) string {
 }
 
 // worker runs one connection: it waits for a pacer slot, pulls a step, sends
-// it, records the result and feeds it back to the scenario.
+// it with retries, records every attempt and feeds the final result back to the
+// scenario.
 func (r *Runner) worker(ctx context.Context) {
 	for {
 		if !r.pacer.Wait(ctx) {
 			return
 		}
-		atomic.AddInt64(&r.sent, 1)
 		step, ok := r.scenario.Next()
 		if !ok {
 			return
 		}
-		resp, attempts := r.client.SendWithRetry(ctx, step.PayloadID, step.Payload, r.policy)
-		r.record(step, resp, attempts)
-		r.scenario.Complete(step, resp)
-		if r.checkStop(resp) {
+		final, attempts, opLatency := r.sendWithRetry(ctx, step)
+		r.record(step, final, attempts, opLatency)
+		r.scenario.Complete(step, final)
+		if r.checkStop(final) {
 			return
 		}
 	}
 }
 
-// record classifies the response and updates counters. The client returns a
-// neutral OutcomeOK for any HTTP 200 with a valid string result; the runner
-// classifies it as a mask or restore based on the step type.
-func (r *Runner) record(step Step, resp Response, attempts int) {
+// sendWithRetry sends a step with retries, gating each retry attempt with the
+// pacer so retries respect the configured intensity limit. It returns the final
+// response, every attempt made, and the total logical-operation duration. The
+// sent counter is incremented on each actual HTTP send, not before the step is
+// known to exist.
+func (r *Runner) sendWithRetry(ctx context.Context, step Step) (Response, []Response, time.Duration) {
+	start := time.Now()
+	var attempts []Response
+	for attempt := 1; attempt <= r.policy.MaxAttempts; attempt++ {
+		if attempt > 1 {
+			// A retry is an additional HTTP send and consumes another pacer
+			// slot so the achieved send rate (including retries) stays within
+			// the configured intensity.
+			if !r.pacer.Wait(ctx) {
+				break
+			}
+		}
+		resp := r.client.Send(ctx, step.PayloadID, step.Payload)
+		atomic.AddInt64(&r.sent, 1)
+		attempts = append(attempts, resp)
+		if resp.Outcome != OutcomeError && resp.Outcome != OutcomeOverload && resp.Outcome != OutcomeTimeout {
+			return resp, attempts, time.Since(start)
+		}
+		if attempt == r.policy.MaxAttempts {
+			return resp, attempts, time.Since(start)
+		}
+		delay := r.policy.BaseDelay
+		if resp.Outcome == OutcomeOverload && resp.RetryAfter > 0 {
+			delay = resp.RetryAfter
+		}
+		select {
+		case <-ctx.Done():
+			return resp, attempts, time.Since(start)
+		case <-time.After(delay):
+		}
+	}
+	last := attempts[len(attempts)-1]
+	return last, attempts, time.Since(start)
+}
+
+// record classifies every attempt and records its latency, then records the
+// logical-operation duration. The client returns a neutral OutcomeOK for any
+// HTTP 200 with a valid string result; the runner classifies it as a mask or
+// restore based on the step type.
+func (r *Runner) record(step Step, final Response, attempts []Response, opLatency time.Duration) {
 	payloadBytes := len(step.Payload)
 	payloadChars := runeCount(step.Payload)
+	for _, resp := range attempts {
+		r.recordAttempt(step, resp, payloadBytes, payloadChars)
+	}
+	r.stats.RecordOp(opLatency)
+}
+
+// recordAttempt classifies one attempt and updates counters. The mask/restore
+// success counters count logical operations: only a final 200 attempt
+// increments them, while intermediate 429/5xx attempts are counted as their own
+// outcomes.
+func (r *Runner) recordAttempt(step Step, resp Response, payloadBytes, payloadChars int) {
 	switch {
 	case resp.Status == 200 && resp.Outcome == OutcomeOK:
 		if step.IsMask {
@@ -123,22 +176,36 @@ func (r *Runner) record(step Step, resp Response, attempts int) {
 				// No PII recognized: the mask equals the original. This is not
 				// a successful mask operation.
 				atomic.AddInt64(&r.maskNoChange, 1)
-				r.stats.RecordChars(OutcomeRepeat, resp.Status, resp.Latency, payloadBytes, payloadChars)
+				r.stats.RecordAttempt(LatencyOther, OutcomeRepeat, resp.Status, resp.Latency, payloadBytes, payloadChars)
 			} else {
 				atomic.AddInt64(&r.maskSuccess, 1)
-				r.stats.RecordChars(OutcomeMask, resp.Status, resp.Latency, payloadBytes, payloadChars)
+				r.stats.RecordAttempt(LatencyMask, OutcomeMask, resp.Status, resp.Latency, payloadBytes, payloadChars)
 			}
 		} else {
 			if resp.Result == step.Original {
 				atomic.AddInt64(&r.restoreSuccess, 1)
-				r.stats.RecordChars(OutcomeRestore, resp.Status, resp.Latency, payloadBytes, payloadChars)
+				r.stats.RecordAttempt(LatencyRestore, OutcomeRestore, resp.Status, resp.Latency, payloadBytes, payloadChars)
 			} else {
 				atomic.AddInt64(&r.restoreMismatch, 1)
-				r.stats.RecordChars(OutcomeError, resp.Status, resp.Latency, payloadBytes, payloadChars)
+				r.stats.RecordAttempt(LatencyError, OutcomeError, resp.Status, resp.Latency, payloadBytes, payloadChars)
 			}
 		}
 	default:
-		r.stats.RecordChars(resp.Outcome, resp.Status, resp.Latency, payloadBytes, payloadChars)
+		r.stats.RecordAttempt(latencyClassFor(resp), resp.Outcome, resp.Status, resp.Latency, payloadBytes, payloadChars)
+	}
+}
+
+// latencyClassFor maps a response outcome to its latency class.
+func latencyClassFor(resp Response) LatencyClass {
+	switch resp.Outcome {
+	case OutcomeOverload:
+		return LatencyOverload
+	case OutcomeError:
+		return LatencyError
+	case OutcomeTimeout:
+		return LatencyTimeout
+	default:
+		return LatencyOther
 	}
 }
 
